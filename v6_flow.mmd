@@ -1,0 +1,35 @@
+%%{init: {'theme':'dark','flowchart':{'curve':'basis'}}}%%
+flowchart TD
+  classDef sell fill:#3a0d18,stroke:#ff4070,color:#ff9bb5,font-weight:bold
+  classDef api fill:#0d1f3a,stroke:#00c8ff,color:#9bd9ff
+  classDef wait fill:#2a1f06,stroke:#ffc040,color:#ffd98a,font-weight:bold
+  classDef human fill:#0d2a1f,stroke:#00e5a0,color:#8af0c8
+  classDef base fill:#15151f,stroke:#3a3a52,color:#e6e6f0
+
+  A["🔍 扫描 / DISCOVERY · Claude.ai"]:::base --> B["✍️ 人工填 q + 止损档<br/>漏填止损档/q/信心/cluster → 弹窗提醒"]:::human
+  B --> C(["📦 持仓"]):::base
+  C --> M{"⏱️ MONITOR 心跳 · 每 180s<br/>_evaluate_position"}:::base
+
+  M -->|"止盈: best_bid≥90¢ 或 浮盈+100%"| SELL["💰 全卖"]:::sell
+  M -->|"TIME_STOP: ≤2天 + 漂移<5pp"| SELL
+  M -->|"价 < $0.05 地板兜底"| SELL
+  M -->|"否则"| EDGE["📊 edge-based 决策<br/>HOLD / MARGINAL / SOFT_NEG / AT_TARGET"]:::base
+  M -->|"%止损线被砸穿?"| STOP{"auto-reeval<br/>开着?"}:::base
+  STOP -->|"关 / 无 API key"| SELL
+  STOP -->|"开"| PEND["⏸️ PENDING_REEVAL<br/>不盲卖, 交给重评决定"]:::wait
+
+  PEND --> TRIG{"🚦 _maybe_trigger_auto_reeval<br/>闸门 = 闩锁 + 6h 冷却"}:::base
+  EDGE -. "亏 ≥ 分档阈值 (各档止损前 5pp)" .-> TRIG
+  BTN["🤖 API重评 手动按钮<br/>主页每仓 / 副屏面板 · 绕过冷却<br/>force_manual = 永远等确认"]:::human --> APIRUN
+
+  TRIG -->|"🟢 在线 = 省钱"| CARD["📋 挂手动卡<br/>你复制 prompt → Claude.ai → 回填 q / 卖"]:::human
+  TRIG -->|"🔴 离线 = 自动"| APIRUN["🌐 后台 Claude API 联网调研<br/>web_search + web_fetch + adaptive<br/>→ 强制 submit_decision"]:::api
+
+  APIRUN --> DEC{"决策就绪<br/>hold / update_q / exit / cancel_autostop"}:::api
+  DEC -->|"🟢 在线 · 或 🤖手动按钮触发"| APPROVE["🙋 挂 pending 等你确认<br/>✅ 确认 / 忽略 / 清空"]:::human
+  DEC -->|"🔴 离线 且 monitor 自动触发"| AUTO["⚡ _auto_execute 自动执行 · 真钱<br/>exit→真卖 / update_q / hold / cancel_autostop"]:::api
+
+  SELL --> DISP["🖥️ 展示层<br/>主页「⏸ 等重评」徽章 · 副屏控制台 /panel<br/>新待处理 → 红闪弹窗 (无声音)"]:::base
+  CARD --> DISP
+  APPROVE --> DISP
+  AUTO --> DISP

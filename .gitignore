@@ -1,0 +1,46 @@
+.env
+.env.local
+.env.bak_*
+*.key
+*.pem
+
+.venv
+__pycache__/
+*.pyc
+*.pyo
+
+*.log
+
+v4.db
+v4.db.bak_*
+
+# 个人 P&L 复盘文档 (从 v4.db 派生, 含真实盈亏; 跟 v4.db 一样不进 git)
+分析报告_*.md
+# 研究数据包 (成交 CSV + 价格曲线, 含真实 P&L; 派生自 v4.db + Polymarket 公开行情)
+research_data/
+
+last_scan.md
+
+.DS_Store
+
+# SQLite WAL mode temp files
+v4.db-shm
+v4.db-wal
+
+# v5.8: per-tag scan reports cache
+data/scan_reports/*.md
+data/scan_reports/manifest.json
+!data/scan_reports/.gitkeep
+
+# tag expansion audit exports (throwaway, regenerate via /tmp/tag_audit_full.py)
+data/tags_all_ranked.csv
+data/tags_mine.csv
+
+# auto_backup.sh push-failure sentinel (runtime marker, not source)
+data/.backup_push_failing
+
+# private sanitization patterns for public releases (real hostname/paths)
+scripts/.release-patterns.sh
+
+# Real-money PnL history (not in public repo)
+data/portfolio_snapshot.jsonl

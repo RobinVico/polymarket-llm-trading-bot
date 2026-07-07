@@ -1,0 +1,155 @@
+import sqlite3
+from datetime import datetime
+
+DB_PATH = "v4.db"
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            market_slug TEXT,
+            detail TEXT
+        );
+        CREATE TABLE IF NOT EXISTS tier_sold (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id TEXT NOT NULL,
+            tier_name TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS position_meta (
+            token_id TEXT PRIMARY KEY,
+            market_slug TEXT,
+            side TEXT,
+            entry_price REAL,
+            tp REAL,
+            target_gap REAL,
+            end_date TEXT,
+            initial_size REAL,
+            created_at TEXT,
+            new_tp REAL,
+            tp_updated_at TEXT,
+            notes TEXT,
+            entry_reason TEXT,
+            claude_raw_estimate REAL,
+            reeval_status TEXT DEFAULT 'pending',
+            reeval_at TEXT,
+            reeval_new_tp REAL,
+            reeval_action TEXT
+        );
+    """)
+    # Migration: 给已有 position_meta 加新字段(忽略已存在错误)
+    for col, decl in [
+        ("entry_reason", "TEXT"),
+        ("claude_raw_estimate", "REAL"),
+        ("reeval_status", "TEXT DEFAULT 'pending'"),
+        ("reeval_at", "TEXT"),
+        ("reeval_new_tp", "REAL"),
+        ("reeval_action", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE position_meta ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit(); conn.close()
+
+def log_event(event_type, market_slug="", detail=""):
+    conn = get_conn()
+    conn.execute("INSERT INTO events (timestamp, event_type, market_slug, detail) VALUES (?,?,?,?)",
+                 (datetime.now().isoformat(), event_type, market_slug, detail))
+    conn.commit(); conn.close()
+
+def get_recent_events(limit=50):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_sold_tiers(token_id):
+    conn = get_conn()
+    rows = conn.execute("SELECT tier_name FROM tier_sold WHERE token_id=?", (token_id,)).fetchall()
+    conn.close()
+    return [r["tier_name"] for r in rows]
+
+def record_tier_sold(token_id, tier_name):
+    conn = get_conn()
+    conn.execute("INSERT INTO tier_sold (token_id, tier_name, timestamp) VALUES (?,?,?)",
+                 (token_id, tier_name, datetime.now().isoformat()))
+    conn.commit(); conn.close()
+
+def save_position_meta(token_id, market_slug, side, entry_price, tp, end_date, initial_size, notes="", entry_reason="", claude_raw_estimate=None):
+    """下单后手动记录元数据，供monitor使用"""
+    target_gap = tp - entry_price if side.upper() in ("YES","Yes") else entry_price - tp
+    conn = get_conn()
+    conn.execute("""INSERT OR REPLACE INTO position_meta 
+        (token_id, market_slug, side, entry_price, tp, target_gap, end_date, initial_size, created_at, notes, entry_reason, claude_raw_estimate, reeval_status) 
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending')""",
+        (token_id, market_slug, side, entry_price, tp, target_gap, end_date, initial_size, datetime.now().isoformat(), notes, entry_reason, claude_raw_estimate))
+    conn.commit(); conn.close()
+
+def get_position_meta(token_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM position_meta WHERE token_id=?", (token_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def update_tp(token_id, new_tp):
+    conn = get_conn()
+    conn.execute("UPDATE position_meta SET new_tp=?, tp_updated_at=? WHERE token_id=?",
+                 (new_tp, datetime.now().isoformat(), token_id))
+    conn.commit(); conn.close()
+
+def get_all_position_meta():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM position_meta").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_daily_spend():
+    """保留兼容性"""
+    from datetime import date
+    today = date.today().isoformat()
+    conn = get_conn()
+    row = conn.execute("""SELECT COUNT(*) as n FROM events 
+        WHERE event_type IN ('buy','add') AND timestamp LIKE ?""", (today+"%",)).fetchone()
+    conn.close()
+    return 0.0
+
+def get_current_phase():
+    return "phase1"
+
+def mark_reeval(token_id, action, new_tp=None):
+    """
+    标记重评状态.
+    action: 'uplift' / 'skip' / 'close'
+    new_tp: 仅 action=uplift 时填写新TP
+    """
+    status_map = {
+        "uplift": "done_uplift",
+        "skip": "done_skip",
+        "close": "done_close",
+    }
+    status = status_map.get(action)
+    if not status:
+        return False
+    conn = get_conn()
+    if action == "uplift" and new_tp is not None:
+        conn.execute("""UPDATE position_meta 
+            SET reeval_status=?, reeval_at=?, reeval_new_tp=?, reeval_action=?, new_tp=?, tp_updated_at=?
+            WHERE token_id=?""",
+            (status, datetime.now().isoformat(), new_tp, action, new_tp, datetime.now().isoformat(), token_id))
+    else:
+        conn.execute("""UPDATE position_meta 
+            SET reeval_status=?, reeval_at=?, reeval_action=?
+            WHERE token_id=?""",
+            (status, datetime.now().isoformat(), action, token_id))
+    conn.commit(); conn.close()
+    return True
+

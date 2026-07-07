@@ -1,0 +1,77 @@
+{
+  "dynamic": [
+    {
+      "label": "Elections",
+      "slug": "elections",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910338+00:00"
+    },
+    {
+      "label": "Rewards 20, 4.5, 50",
+      "slug": "rewards-20-4pt5-50",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910355+00:00"
+    },
+    {
+      "label": "UK Labour Leadership",
+      "slug": "uk-labour-leadership",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910359+00:00"
+    },
+    {
+      "label": "Starmer",
+      "slug": "starmer",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910362+00:00"
+    },
+    {
+      "label": "World Elections",
+      "slug": "world-elections",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910364+00:00"
+    },
+    {
+      "label": "fomc",
+      "slug": "fomc",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910370+00:00"
+    },
+    {
+      "label": "US Election",
+      "slug": "us-presidential-election",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910373+00:00"
+    },
+    {
+      "label": "United States",
+      "slug": "united-states",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910375+00:00"
+    },
+    {
+      "label": "Iran Ceasefire",
+      "slug": "diplomacy-ceasefire",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910378+00:00"
+    },
+    {
+      "label": "Basketball",
+      "slug": "basketball",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910380+00:00"
+    },
+    {
+      "label": "Strait of Hormuz",
+      "slug": "strait-of-hormuz",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910383+00:00"
+    },
+    {
+      "label": "U.S. x Iran",
+      "slug": "trump-iran",
+      "tier": 2,
+      "added_at": "2026-07-06T14:41:54.910386+00:00"
+    }
+  ],
+  "extra_blacklist": []
+}

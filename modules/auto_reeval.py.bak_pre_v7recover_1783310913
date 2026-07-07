@@ -1,0 +1,221 @@
+"""
+v5.13: 大跌自动重评 (auto-reeval on big drawdown).
+
+流程: monitor 心跳发现某仓位亏损 >= 阈值 (默认 30%) → 后台线程调用 Claude API 联网调研
+(web_search + web_fetch + adaptive thinking) → 强制 submit_decision 工具输出结构化决策
+(hold / update_q / exit) → 写入 auto_reeval_suggestions 表 status='pending' → 用户在
+dashboard 对应区块点确认才执行。**不自动卖**。ANTHROPIC_API_KEY 缺失时整个特性静默禁用。
+
+判定口径刻意写进 prompt: 看论点有没有被真新闻推翻 (不是单纯回撤), q 不许只因价跌就锚到现价。
+"""
+import os
+import logging
+from datetime import datetime, timezone
+
+log = logging.getLogger("monitor")
+
+
+def _f(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _i(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# ---- 可调参数 (env 可覆盖, 不用改代码) ----
+LOSS_THRESHOLD = _f("AUTO_REEVAL_LOSS_PCT", 0.30)     # 亏 >= 30% 触发
+COOLDOWN_HOURS = _f("AUTO_REEVAL_COOLDOWN_H", 12)     # 同一仓位冷却 12 小时, 防重复触发
+MODEL = os.environ.get("AUTO_REEVAL_MODEL", "claude-opus-4-8")
+MAX_TOKENS = _i("AUTO_REEVAL_MAX_TOKENS", 12000)
+MAX_ROUNDS = _i("AUTO_REEVAL_MAX_ROUNDS", 15)          # agentic 循环上限 (防跑飞)
+_ENABLED = os.environ.get("AUTO_REEVAL_ENABLED", "1") not in ("0", "false", "False", "")
+
+
+def is_enabled():
+    """启用 = 总开关开 且 有 API key。缺 key 则静默禁用, 不报错。"""
+    return _ENABLED and bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
+# ---- submit_decision: 程序读这个结构 ----
+DECISION_TOOL = {
+    "name": "submit_decision",
+    "description": "联网调研完成后, 调用本工具提交对该持仓的最终结构化决策。必须调用本工具, 不要只用文字回答。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["hold", "update_q", "exit"],
+                "description": "hold=继续持有; update_q=继续持有但更新概率估计; exit=清仓",
+            },
+            "new_q": {
+                "type": "number",
+                "description": "0-1 之间。重新校准的'持有方向最终兑现'的概率, 必须从基本面+新闻推导, 不许只因现价低就压低。",
+            },
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "thesis_broken": {
+                "type": "boolean",
+                "description": "仅作标记: 是否有重大不利事件真正推翻原始论点 (单纯价格波动=false)。这不是决策前提 — 没有重大事件你照样可以 update_q / hold / 在 edge 转负时 exit。",
+            },
+            "headline_event": {
+                "type": "string",
+                "description": "若 thesis_broken=true, 一句话说明是什么事件; 否则一句话说明本次 q 判断的核心依据 (如 '民调小幅走弱' / '无重大变化, 维持原判' 等)。",
+            },
+            "reason": {"type": "string", "description": "2-4 句中文理由。"},
+            "sources": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "关键一手来源 URL (可为空数组)。",
+            },
+        },
+        "required": ["action", "new_q", "confidence", "thesis_broken", "headline_event", "reason", "sources"],
+        "additionalProperties": False,
+    },
+}
+
+WEB_TOOLS = [
+    {"type": "web_search_20260209", "name": "web_search"},
+    {"type": "web_fetch_20260209", "name": "web_fetch"},
+]
+
+PROMPT_TMPL = """你是 Polymarket 持仓风控分析师。下面这个持仓出现了大幅回撤, 需要你**联网调研最新一手信息**后给出处置决策。
+
+# 持仓
+市场: {title}
+slug: {slug}
+方向: 持有 {side}（{side} 兑现我就赢, 价格涨=我赚）
+入场均价: ${avg:.3f}（我的成本）
+当前价: ${cur:.3f}
+浮动盈亏: {pnl:+.1f}%
+距结算: {days} 天
+Resolution 规则: {desc}
+
+# 任务
+联网查与该 resolution 直接相关的最新进展（官方表态 / 数据公布 / 权威报道 / 民调等）,
+**从零重新评估 q（持有方向最终兑现的概率）**, 然后给出处置决策。
+
+# 判定纪律
+1. 价格跌 ≠ 论点一定错。事件驱动型市场常因消息震荡, 价格不完全等于真相。
+2. q 必须基于你的调研（resolution 规则 + 基本面 + 带日期的新闻/数据）独立得出, 不要机械地照着现价反推 q。
+   但只要调研支持, **你完全可以、也应该更新 q（调高或调低都行）, 不需要一定有"重大事件"才能动 q**。
+3. 决策依据 = 你重估的 q 对当前价的 edge（扣掉滑点+手续费约 2-3pp 后的实际可获取值）+ 是否有重大不利变化:
+   - edge 仍明显为正 → hold, 或 update_q（继续持有但把 q 更新成你的最新判断）。
+   - edge 转负 / 论点明显走弱 → exit。
+4. "关键机构长期不更新 / 本该发生的事迟迟不发生" 也算逆向信号, 应反映到 q 里。
+
+# 调研要求
+- 至少做 3-5 次独立搜索, 优先一手来源, 必要时抓取关键页面全文。
+- 聚焦最近的、能影响该 resolution 的硬信息。
+
+# 输出（必须）
+调研完成后, **必须调用 submit_decision 工具**输出结构化决策。不要只用文字回答。
+"""
+
+
+def _days_left(end_date):
+    if not end_date:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+        return (dt - datetime.now(timezone.utc)).days
+    except Exception:
+        return None
+
+
+def _build_prompt(pos, meta):
+    meta = meta or {}
+    avg = float(pos.get("avg_price") or meta.get("entry_price") or 0)
+    cur = float(pos.get("cur_price") or 0)
+    pnl = ((cur - avg) / avg * 100) if avg > 0 else 0
+    side = pos.get("outcome") or meta.get("side") or "?"
+    days = _days_left(meta.get("end_date"))
+    return PROMPT_TMPL.format(
+        title=pos.get("title", ""),
+        slug=meta.get("market_slug") or "",
+        side=str(side).upper(),
+        avg=avg, cur=cur, pnl=pnl,
+        days=(days if days is not None else "?"),
+        desc=(meta.get("notes") or "(dashboard 未存 resolution 原文; 请按市场标题与 slug 联网查证)"),
+    )
+
+
+def run_auto_reeval(pos, meta):
+    """同步调用 API (在后台线程里跑)。返回 decision dict, 或 {'error': ...}。"""
+    import anthropic
+
+    client = anthropic.Anthropic(timeout=600.0, max_retries=2)
+    tools = WEB_TOOLS + [DECISION_TOOL]
+    messages = [{"role": "user", "content": _build_prompt(pos, meta)}]
+    raw_text = []
+    decision = None
+    forced = False
+
+    try:
+        for _ in range(MAX_ROUNDS):
+            kwargs = dict(
+                model=MODEL, max_tokens=MAX_TOKENS, tools=tools,
+                messages=messages, thinking={"type": "adaptive"},
+            )
+            if forced:
+                kwargs["tool_choice"] = {"type": "tool", "name": "submit_decision"}
+            resp = client.messages.create(**kwargs)
+
+            for b in resp.content:
+                bt = getattr(b, "type", None)
+                if bt == "text":
+                    raw_text.append(b.text or "")
+                elif bt == "tool_use" and getattr(b, "name", None) == "submit_decision":
+                    decision = dict(b.input)
+            if decision is not None:
+                break
+
+            sr = resp.stop_reason
+            messages.append({"role": "assistant", "content": resp.content})
+
+            if sr == "refusal":
+                return {"error": "模型安全拒绝 (refusal), 无法调研该标的"}
+            if sr == "pause_turn":
+                continue  # 服务端联网工具还没跑完, 再发一次继续
+            # end_turn / tool_use / max_tokens 但没给决策 → 逼它调用 submit_decision
+            if forced:
+                break  # 已经强制过一次还不给 → 放弃
+            messages.append({
+                "role": "user",
+                "content": "请基于上面的调研, 现在立即调用 submit_decision 工具给出最终结构化决策, 不要再继续搜索。",
+            })
+            forced = True
+
+        if decision is None:
+            return {"error": "未拿到结构化决策 (模型未调用 submit_decision)",
+                    "raw_text": " ".join(raw_text)[:1000]}
+        decision["raw_text"] = " ".join(raw_text)[:2000]
+        return decision
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def run_and_store(sug_id, pos, meta):
+    """后台线程入口: 跑 API → 写回 auto_reeval_suggestions。"""
+    from modules.db import update_auto_reeval_decision, update_auto_reeval_error
+    try:
+        d = run_auto_reeval(pos, meta)
+        if "error" in d:
+            update_auto_reeval_error(sug_id, d["error"])
+            log.warning(f"auto_reeval id={sug_id} 失败: {d['error']}")
+        else:
+            update_auto_reeval_decision(sug_id, d)
+            log.info(f"auto_reeval id={sug_id} → action={d.get('action')} "
+                     f"thesis_broken={d.get('thesis_broken')} conf={d.get('confidence')}")
+    except Exception as e:
+        try:
+            update_auto_reeval_error(sug_id, f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        log.warning(f"auto_reeval id={sug_id} 线程异常: {e}")

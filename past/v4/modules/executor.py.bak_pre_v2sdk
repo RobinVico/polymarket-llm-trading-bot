@@ -1,0 +1,222 @@
+import os
+import requests
+import json
+import logging
+from dotenv import load_dotenv
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OpenOrderParams, OrderArgs
+from py_clob_client.order_builder.constants import BUY, SELL
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+log = logging.getLogger("executor")
+load_dotenv("<sibling-v3-dir>/.env")
+
+HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137
+DATA_API = "https://data-api.polymarket.com"
+FUNDER = os.getenv("POLY_FUNDER")
+PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY")
+SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
+
+def _s():
+    s = requests.Session()
+    s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[500,502,503,504])))
+    return s
+
+_instance = None
+
+class Executor:
+    def __init__(self):
+        self.client = None
+        try:
+            key = os.getenv("POLY_PRIVATE_KEY")
+            funder = os.getenv("POLY_FUNDER")
+            sig = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
+            if not key:
+                log.error("POLY_PRIVATE_KEY not found in .env")
+                return
+            self.client = ClobClient(host=HOST, chain_id=CHAIN_ID, key=key, signature_type=sig, funder=funder)
+            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            log.info("CLOB client OK")
+        except Exception as e:
+            log.error(f"CLOB init failed: {e}")
+
+    @classmethod
+    def get(cls):
+        global _instance
+        if _instance is None:
+            _instance = cls()
+        return _instance
+
+    def get_positions(self):
+        try:
+            resp = _s().get(f"{DATA_API}/positions", params={"user": FUNDER, "limit": 100, "sizeThreshold": 0}, timeout=30).json()
+            if isinstance(resp, str):
+                log.warning(f"API returned string: {resp[:100]}")
+                return []
+            if not isinstance(resp, list):
+                log.warning(f"API returned unexpected type: {type(resp)}")
+                return []
+            positions = []
+            for p in resp:
+                size = float(p.get("size", 0))
+                if size <= 0: continue
+                positions.append({
+                    "title": p.get("title", "unknown"),
+                    "side": p.get("outcome", ""),
+                    "size": size,
+                    "avg_price": float(p.get("avgPrice", 0)),
+                    "cur_price": float(p.get("curPrice", 0)),
+                    "pnl_pct": float(p.get("percentPnl", 0)),
+                    "asset": p.get("asset", ""),
+                    "condition_id": p.get("conditionId", ""),
+                })
+            log.info(f"{len(positions)} positions")
+            return positions
+        except Exception as e:
+            log.warning(f"get_positions failed: {e}")
+            return []
+
+    def sell(self, token_id, size, reason=""):
+        """
+        市价卖出 (FAK + best_bid限价 + 滑点保护).
+        - 拉盘口找best_bid作为限价
+        - OrderType.FAK: 能成交多少立刻成交,剩余自动cancel(不会挂着)
+        - 严格检查API返回,只有真实makingAmount>0才return True
+        """
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        try:
+            if not self.client:
+                log.error("sell: client未初始化")
+                return False
+            
+            # === Step 1: size 2位小数 (Polymarket SELL精度限制) ===
+            size = round(size, 2)
+            if size < 0.01:
+                log.warning(f"sell: size={size} 过小, 跳过")
+                return False
+            
+            # === Step 2: 拉盘口 ===
+            try:
+                book = self.client.get_order_book(token_id)
+            except Exception as e:
+                log.error(f"sell: get_order_book失败: {e}")
+                return False
+            
+            # 兼容dict和OrderBookSummary对象
+            bids = None
+            if isinstance(book, dict):
+                bids = book.get("bids")
+            elif hasattr(book, "bids"):
+                bids = book.bids
+            
+            if bids is None:
+                log.error(f"sell: 无法解析book, type={type(book).__name__}, repr={book!r}"[:300])
+                return False
+            if len(bids) == 0:
+                log.error(f"sell: 盘口无bid (无买家), token={token_id[:20]}")
+                return False
+            
+            # === Step 3: 找best_bid (最高买价) ===
+            def _price(b):
+                if hasattr(b, "price"): return float(b.price)
+                if isinstance(b, dict): return float(b["price"])
+                if isinstance(b, (list, tuple)): return float(b[0])
+                raise ValueError(f"unknown bid format: {b}")
+            try:
+                best_bid = max(_price(b) for b in bids)
+            except Exception as e:
+                log.error(f"sell: 解析bids失败 {e}, sample={bids[:1]}")
+                return False
+            if best_bid <= 0:
+                log.error(f"sell: best_bid={best_bid} 异常")
+                return False
+            
+            log.info(f"SELL token={token_id[:20]}... size={size} best_bid=${best_bid:.4f} reason={reason}")
+            
+            # === Step 4: FAK订单 (能成交多少成交多少, 剩余cancel) ===
+            order_args = OrderArgs(price=best_bid, size=size, side=SELL, token_id=token_id)
+            try:
+                signed = self.client.create_order(order_args)
+                result = self.client.post_order(signed, OrderType.FAK)
+            except Exception as e:
+                log.exception(f"sell: post_order异常: {e}")
+                return False
+            
+            log.info(f"sell raw result: {result}")
+            
+            # === Step 5: 严格检查 ===
+            if not isinstance(result, dict):
+                log.error(f"sell: result不是dict, type={type(result).__name__} val={result!r}"[:200])
+                return False
+            
+            success = result.get("success", False)
+            err_msg = result.get("errorMsg", "")
+            status = result.get("status", "unknown")
+            order_id = result.get("orderID", "?")
+            try:
+                making_amount = float(result.get("makingAmount", 0))
+            except (ValueError, TypeError):
+                making_amount = 0.0
+            
+            if not success:
+                log.error(f"sell FAILED: {err_msg or '(no errorMsg)'} | order_id={order_id} | full={result}")
+                return False
+            
+            if making_amount <= 0:
+                log.error(f"sell: 0成交 status={status} order_id={order_id} (盘口太薄/价格slip) result={result}")
+                return False
+            
+            pct = making_amount / size * 100 if size > 0 else 0
+            if making_amount < size * 0.95:
+                log.warning(f"sell部分成交: 请求{size} 实际{making_amount:.4f}股 ({pct:.0f}%) order_id={order_id}")
+            else:
+                log.info(f"sell成功: 卖{making_amount:.4f}股 order_id={order_id} status={status}")
+            return True
+        
+        except Exception as e:
+            log.exception(f"sell exception: {e}")
+            return False
+
+    def sell_partial(self, token_id, total_size, pct, reason=""):
+        sell_size = round(total_size * pct / 100, 2)
+        if sell_size < 0.1:
+            sell_size = total_size
+        return self.sell(token_id, sell_size, reason)
+
+    def sell_partial(self, token_id, total_size, pct, reason=""):
+        sell_size = round(total_size * pct / 100, 2)
+        if sell_size < 0.1:
+            sell_size = total_size
+        return self.sell(token_id, sell_size, reason)
+
+    def sell_partial(self, token_id, total_size, pct, reason=""):
+        sell_size = round(total_size * pct / 100, 2)
+        if sell_size < 0.1:
+            sell_size = total_size
+        return self.sell(token_id, sell_size, reason)
+
+    def sell_partial(self, token_id, total_size, pct, reason=""):
+        sell_size = round(total_size * pct / 100, 2)
+        if sell_size < 0.1:
+            sell_size = total_size
+        return self.sell(token_id, sell_size, reason)
+
+    def sell_partial(self, token_id, total_size, pct, reason=""):
+        sell_size = round(total_size * pct / 100, 2)
+        if sell_size < 0.1:
+            sell_size = total_size
+        return self.sell(token_id, sell_size, reason)
+
+    def sell_partial(self, token_id, total_size, pct, reason=""):
+        sell_size = round(total_size * pct / 100, 2)
+        if sell_size < 0.1:
+            sell_size = total_size
+        return self.sell(token_id, sell_size, reason)
+
+    def sell_partial(self, token_id, total_size, pct, reason=""):
+        sell_size = round(total_size * pct / 100, 2)
+        if sell_size < 0.1:
+            sell_size = total_size
+        return self.sell(token_id, sell_size, reason)

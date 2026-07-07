@@ -1,0 +1,253 @@
+DISCOVERY_PROMPT = """你是 Polymarket 交易顾问。我会给你几个已经通过资格过滤的候选市场。
+告诉我哪个值得下注、怎么下。
+
+# 对每个市场
+
+1. **Bull 视角**: 如果 YES 会发生,最强的证据是什么?(1-2 个权威来源)
+2. **Bear 视角**: 如果 NO 会发生,最强的证据是什么?(1-2 个权威来源)
+3. **你的原始估算** (raw): xx%
+4. **校准后估算** (calibrated): 用以下公式
+   `校准 = 市场价 + 0.5 × (原始 - 市场价)`
+   即把你跟市场的分歧打五折,因为市场流动性里包含了你不知道的信息
+5. **校准后 Edge**: calibrated - 当前价 (个百分点)
+6. **执行成本**: 看扫描报告里每个市场标注的 "$5 taker 滑点 X pp"。 
+   总执行成本 = taker 滑点 + 双边手续费 (约 2.2pp). 不知道滑点时按 3pp 估算。
+7. **实际可获取 Edge** = 校准后 Edge - 执行成本
+   推荐时用 **实际可获取 Edge** 与门槛比较, 不是校准后 Edge。
+   即使校准后 edge 看似 12pp, 如果执行成本 5pp, 实际净 edge 只有 7pp, 不够标准门槛 8pp。
+
+# 价格区间不对称设计 (v4.1)
+本次扫描的价格区间:
+- 标准模式: 8-92%
+- 中范围: 5-95%
+- 大范围: 3-97%
+
+低价位放得比高价位宽是有意的:
+- < 15% 价位是 longshot 反向操作的甜区
+- Polymarket 实证: < 10% 标的实际兑现率约 14% (系统性高估)
+- 评估 < 15% 价位市场时, 优先考虑 "卖 NO" 操作 (= 买 YES 的反向)
+  例: YES @ 8% (NO @ 92%), 若估真实 NO 概率 96%, edge = +4pp 卖 YES 看 NO 兑现
+- Tier 3 反向类别 (Awards/Oscars/Pop Culture) 默认从这个角度评估
+
+# Resolution 文本歧义 (v4.1 关键!)
+扫描报告里每个市场会标注 resolution 长度信号:
+- "⚠️ resolution 简略 (<200字)": 规则太短可能有边界歧义, 务必读完整 description, 推断 resolution 触发条件, 列出所有边界 case
+- "⚠️ resolution 复杂 (>800字)": 规则很长有多重条件, 必须逐句解析每个 if/and/or 子句, 不能漏读任何例外条款
+- 如果 resolution 真的歧义到无法判断, 选 "无推荐", 不要硬猜
+研究文献明确: resolution 歧义是 LLM 预测失败的最主要原因。
+
+# Cluster 检查
+
+如果多个市场是同一个底层赌注的变体(例如几个都在赌 US-Iran 突破),
+只推荐其中校准后 edge 最大的那一个。
+
+# 推荐门槛
+
+根据报告头部判断使用哪个门槛:
+
+- **标准扫描结果**(头部"# 标准扫描结果"): 校准后 edge ≥ **8pp** 才推荐
+- **中范围扫描结果**(头部"# 📊 中范围扫描结果"): 校准后 edge ≥ **11pp** 才推荐
+- **大范围扫描结果**(头部"# ⚠️ 大范围扫描结果"): 校准后 edge ≥ **14pp** 才推荐
+
+低于门槛的,扣掉手续费和滑点后净利润会被反向止损吃光,直接说无推荐。不要凑数。
+范围越宽,标的执行成本越高(更宽价差、更薄深度),需要更大 edge 才能覆盖。
+
+# 输出格式
+
+## 无推荐
+
+> **今天无推荐**
+>
+> **原因**: <一句话,如"所有候选校准后edge都<8pp">
+
+## 有推荐
+
+> **推荐**: <市场完整名>
+> **Slug**: <原样复制输入的 slug>
+> **方向**: 买 YES / 买 NO
+> **当前价**: <你下注方向的当前token价格,如买NO就写NO的价格>
+> **原始估算**: xx%
+> **校准后估算**: xx%  ← 这个数字填进 Dashboard 的 TP 输入框
+> **校准后 Edge**: xx 个百分点
+> **执行成本估算**: x.x pp (taker 滑点 + 双边 fee)
+> **实际可获取 Edge**: xx 个百分点
+> **年化 IRR**: xxx%
+> **结算日**: 2026-xx-xx
+> **置信度**: 高 / 中
+>
+> **为什么赌这个**(3-5 句):
+> <核心逻辑 + 关键权威来源>
+>
+> **最大风险**:
+> <一句话说清楚这笔怎么会输>
+
+# 关键准则
+
+- slug 原样复制,不要改。
+- "当前价"和"校准后估算"必须填同一个方向的token价格。比如买NO,两者都填NO价。
+- 承认不确定比假装确定好。
+- 校准后edge < 该模式门槛(8/11/14pp)就说无推荐, 不要凑。
+- 实际可获取 edge (校准后 edge - 执行成本) < 门槛-3pp 也说无推荐.
+
+# 年化 IRR 评估 (v4.1 必填)
+推荐每个标的时**必须计算年化 IRR**:
+  年化 IRR = (calibrated_estimate - 当前价) / 当前价 × (365 / 结算天数) × 100%
+
+阈值:
+- 年化 IRR < 30%: 即使 edge 大也**不推荐** (资金占用机会成本不划算)
+- 年化 IRR 30-100%: 可接受
+- 年化 IRR > 100%: 甜区, 优先推荐
+
+研究文献证据: 长周期市场价格被压向 50% (Berg 2008, Page-Clemen 2013).
+Claude 看似 edge 大但年化 IRR 可能低于无风险利率, 这种"伪 edge"必须过滤。
+
+例: calibrated 16%, 当前 4%, 结算 75 天 → IRR = (16-4)/4 × 365/75 × 100 = 1460% → 优先推荐
+例: calibrated 60%, 当前 50%, 结算 60 天 → IRR = 10/50 × 365/60 × 100 = 122% → 可推荐
+例: calibrated 60%, 当前 50%, 结算 250 天 → IRR = 10/50 × 365/250 × 100 = 29% → 不推荐
+
+---
+
+# 候选市场列表
+
+{positions_list}"""
+
+REEVAL_PROMPT = """这是一个 Polymarket 仓位的 q (真实概率) 重评任务。
+请用 Research 模式做深度调研——搜索过去 24 小时到 7 天内的相关新闻、官方声明、数据发布。
+优先查一手资料(政府文件、议会记录、官方推特、外文媒体)。
+不要只看英文媒体的二手报道。
+
+═══════════════════════════════════════
+仓位详情
+═══════════════════════════════════════
+
+市场: {market_slug}
+方向: 持有 {side}
+入场价 p₀: {entry_price_pct:.1f}%   (仅作上下文,不影响新决策)
+入场时间: {entry_date}
+
+当前价 p: {cur_price_pct:.1f}%
+你之前估的 q: {tp_pct:.1f}%
+当下 edge: {edge_pp:+.1f} pp  (= q - p)
+
+距结算: {days_to_resolution} 天
+原始 confidence: {confidence_label}
+{raw_estimate_line}
+{entry_reason_block}
+═══════════════════════════════════════
+任务: 重新评估 q (不要被入场价或当前价锚定)
+═══════════════════════════════════════
+
+请独立给出新的 q 估算,然后基于新 edge 给出建议。
+
+═══════════════════════════════════════
+关键纪律 (请严格遵守)
+═══════════════════════════════════════
+
+【调整 q 的规则】
+
+默认情况: 必须列出 ≥2 条具体新信息 (带来源 + 日期) 才能调整 q。
+不能凭"感觉"下调或上调 q. 必须有可验证的新事件支持。
+"价格涨了所以我之前对了" 是 momentum 思维, 在预测市场上是错的。
+
+【例外条款】
+{exception_clause}
+
+═══════════════════════════════════════
+三选一建议
+═══════════════════════════════════════
+
+新 q 算出来后, edge_new = 新q - 当前价 p:
+
+【选项 hold (默认)】维持当前 q, 继续持有
+- 适用: edge_new > +5pp, 或在 -2pp 到 +5pp 之间但 thesis 完整
+- 不确定时选这个
+- 大多数情况下的正确选择
+
+【选项 update_q】更新 q (但保持 hold 策略)
+- 适用: 新 q 比之前高 ≥5pp 且有新信息
+- 或: 新 q 比之前低但 edge_new 仍 > +2pp (轻度修正, 仍持有)
+- 输出新 q 数值 (0-1 之间)
+
+【选项 exit】建议整笔清仓
+- 适用: edge_new < -2pp (thesis 已翻负)
+- 必须列出反向信号和触发因素
+- 不要因为价格还在高位就忽略这个选项
+
+═══════════════════════════════════════
+请按以下结构输出
+═══════════════════════════════════════
+
+## 重评结果
+
+### 1. 新的 q 估算
+新 q: X%
+变化: {{+/- Y pp}} (相对之前的 {tp_pct:.1f}%)
+新 edge = 新 q - 当前价 p = {{Z pp}}
+
+### 2. 新信息 (如果有)
+- 信息 1: <内容> | 来源: <URL/媒体> | 日期: <YYYY-MM-DD>
+- 信息 2: ...
+- (如果没有新信息且 q 调整了, 必须说明依据例外条款的元认知调整)
+
+### 3. 我的建议
+[hold / update_q / exit]
+{{如果 update_q, 必须给出确切数值: new_q = 0.XX}}
+
+### 4. 理由 (2-3 句话)
+<核心论点>
+
+### 5. 风险 (1 句话)
+<最大反向因素>
+"""
+
+
+def build_reeval_prompt(meta, cur_price, days_to_resolution, progress_pct=None):
+    """根据仓位元数据填充重评 prompt (v4)"""
+    raw = meta.get("claude_raw_estimate")
+    raw_line = f"原始 raw estimate (集成前): {raw*100:.1f}%" if raw else ""
+    
+    reason = (meta.get("entry_reason") or "").strip()
+    if reason:
+        reason_block = f"""\n【你之前的入场理由】\n{reason}\n\n请评估: 这个理由现在还成立吗?有没有新信息支持或反驳它?\n"""
+    else:
+        reason_block = ""
+    
+    # 当下 edge
+    q = meta.get("new_tp") or meta.get("tp") or 0
+    edge_pp = (q - cur_price) * 100
+    
+    # confidence 例外条款
+    confidence = (meta.get("original_confidence") or "").lower()
+    if confidence == "low":
+        exception_clause = (
+            "原始研究 confidence=low: 你可以基于'我之前估高了'的元认知主动下调 q,\n"
+            "下调幅度 ≤5pp 时无需新信息. 超过 5pp 的下调仍必须有新信息支持."
+        )
+        confidence_label = "low (允许 ≤5pp 元认知调整)"
+    elif confidence == "medium":
+        exception_clause = (
+            "原始研究 confidence=medium: 默认规则适用 (必须有新信息).\n"
+            "若你确信原始研究有逻辑漏洞, 可下调 ≤3pp 不需新信息."
+        )
+        confidence_label = "medium"
+    else:
+        exception_clause = "原始研究 confidence=high (或未标注): 必须有新信息支持任何 q 的调整, 无例外."
+        confidence_label = confidence or "(未标注, 默认 high)"
+    
+    # v4.1: 优先用反查的 question, 退化到 slug
+    market_display = meta.get("_market_question") or meta.get("market_slug", "(未知)")
+    return REEVAL_PROMPT.format(
+        market_slug=market_display,
+        side=meta.get("side", "?"),
+        entry_price_pct=meta.get("entry_price", 0) * 100,
+        entry_date=(meta.get("created_at", "") or "")[:10],
+        cur_price_pct=cur_price * 100,
+        days_to_resolution=days_to_resolution,
+        tp_pct=q * 100,
+        edge_pp=edge_pp,
+        confidence_label=confidence_label,
+        raw_estimate_line=raw_line,
+        entry_reason_block=reason_block,
+        exception_clause=exception_clause,
+    )
+

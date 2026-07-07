@@ -1,0 +1,5645 @@
+from flask import Flask, render_template_string, jsonify, request as flask_request, redirect, session, send_from_directory
+from modules.version import VERSION  # v7.x (#1): 单一版本号来源, 网页/日志/GitHub 同步
+from modules.db import get_recent_events, init_db
+from modules.executor import Executor
+from modules.monitor import (TIME_STOP_DAYS, TIME_STOP_DRIFT_PP, HOLD_MIN_EDGE_PP,
+                              SOFT_NEGATIVE_THRESHOLD_PP,
+                              TAKE_PROFIT_PRICE, TAKE_PROFIT_PNL_PCT,
+                              STOP_LOSS_PCT_BY_TIER, STOP_LOSS_PCT_LEGACY, EVENT_DRIVEN_FLOOR_PRICE)
+from modules.prompts import DISCOVERY_PROMPT
+from modules.scanner import scan_and_report
+from datetime import datetime, timedelta
+import json, subprocess, threading, logging, os, secrets, time
+
+log = logging.getLogger("dashboard")
+_monitor = None
+
+def set_monitor(m):
+    global _monitor
+    _monitor = m
+
+# === 简单密码登录 (v5.7 2026-05-29) ===
+# 仅对非 127.0.0.1 来源生效. 本机 zero-auth, tailnet/Funnel 来源需密码.
+# 5 次错密码 → 30 分钟 lockout. v5.7 (P11): 持久化到 SQLite login_attempts 表,
+# 进程重启不会清零计数, 防"重启绕过爆破".
+LOGIN_LOCKOUT_MAX = 5
+LOGIN_LOCKOUT_WINDOW = 1800  # 30 min
+
+def _rate_check(ip):
+    from modules.db import get_login_attempt, delete_login_attempt
+    rec = get_login_attempt(ip)
+    if not rec:
+        return True
+    count = rec.get("fail_count", 0)
+    start_ts = rec.get("window_start_ts", 0)
+    if time.time() - start_ts > LOGIN_LOCKOUT_WINDOW:
+        delete_login_attempt(ip)
+        return True
+    return count < LOGIN_LOCKOUT_MAX
+
+def _rate_fail(ip):
+    from modules.db import get_login_attempt, upsert_login_attempt
+    rec = get_login_attempt(ip)
+    now = time.time()
+    if not rec or now - rec.get("window_start_ts", 0) > LOGIN_LOCKOUT_WINDOW:
+        upsert_login_attempt(ip, 1, now)
+    else:
+        upsert_login_attempt(ip, rec.get("fail_count", 0) + 1, rec.get("window_start_ts"))
+
+def _rate_clear(ip):
+    """v5.7 (P11): on successful login, clear failed attempts so legitimate user not locked next time."""
+    from modules.db import delete_login_attempt
+    delete_login_attempt(ip)
+
+LOGIN_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Polymarket Dashboard · Login</title>
+<style>
+body{margin:0;font-family:-apple-system,'Helvetica Neue',sans-serif;background:#0a0a1e;color:#e0e0f0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{background:#15152e;border:1px solid #2a2a4a;border-radius:12px;padding:32px 28px;width:300px;box-shadow:0 4px 24px rgba(0,0,0,0.4)}
+h1{font-size:16px;margin:0 0 4px;color:#00c8ff;letter-spacing:0.5px}
+.sub{font-size:11px;color:#7878a0;margin-bottom:22px}
+label{font-size:11px;color:#9090b0;display:block;margin-bottom:6px}
+input[type=password]{width:100%;box-sizing:border-box;background:#0a0a1e;border:1px solid #2a2a4a;color:#e0e0f0;padding:10px 12px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:13px;outline:none}
+input[type=password]:focus{border-color:#00c8ff}
+button{width:100%;margin-top:18px;background:#00c8ff;color:#0a0a1e;border:0;padding:10px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer}
+button:hover{background:#33d6ff}
+.err{color:#ff4070;font-size:11px;margin-top:12px;text-align:center}
+</style></head><body>
+<form class="box" method="post" action="/login">
+<h1>Polymarket Dashboard</h1>
+<div class="sub">请输入访问密码</div>
+<label>Password</label>
+<input type="password" name="password" autofocus required>
+<button type="submit">Sign In</button>
+{% if error %}<div class="err">{{ error }}</div>{% endif %}
+</form></body></html>
+"""
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Polymarket · 主页</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦖</text></svg>">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a14;--sf0:#0f0f1c;--sf:#16162a;--sf2:#1c1c36;--sf3:#23234a;--bd:rgba(255,255,255,0.06);--bd2:rgba(255,255,255,0.10);--tx:#e8e8ff;--tx2:#9898c8;--tx3:#6868b0;--ac:#00e5a0;--ac2:#00c8ff;--rd:#ff4070;--am:#ffc040;--vi:#8060ff;--acd:rgba(0,229,160,0.10);--rdd:rgba(255,64,112,0.10)}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;background-image:radial-gradient(ellipse 1400px 700px at 50% -10%,rgba(0,200,255,0.05),transparent 65%),radial-gradient(ellipse 800px 500px at 90% 100%,rgba(128,96,255,0.04),transparent 60%);background-attachment:fixed;position:relative}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(255,255,255,0.012) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.012) 1px,transparent 1px);background-size:32px 32px;pointer-events:none;z-index:0}
+.wrap{position:relative;z-index:1}
+nav{background:rgba(10,10,20,0.72);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-bottom:1px solid var(--bd);padding:0 28px;height:56px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.nl{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#00e5a0,#00c8ff);display:flex;align-items:center;justify-content:center;font-weight:700;color:#060610;font-size:14px;font-family:'JetBrains Mono'}
+.nt{font-size:14px;font-weight:600}.nt span{color:var(--tx3);font-weight:400;margin-left:8px;font-size:12px}
+/* Chrome 离线小恐龙: 恐龙原地, 地面/仙人掌从右往左滚, 多只恐龙挨在一起一组跳 */
+.dino-track{position:relative;flex:1;height:34px;margin-right:24px;min-width:280px;overflow:hidden;user-select:none}
+.dino-track .ground{position:absolute;bottom:7px;left:0;right:0;height:1px;background:var(--tx3);opacity:0.55}
+/* 仙人掌: 4.5s 一轮, 3 个错开 1.5s 等距出现 */
+.dino-track .cactus{position:absolute;bottom:8px;line-height:1;animation:cactus-roll 4.5s linear infinite;will-change:left}
+.dino-track .c1{animation-delay:0s;font-size:14px}
+.dino-track .c2{animation-delay:-1.5s;font-size:11px}
+.dino-track .c3{animation-delay:-3.0s;font-size:13px}
+@keyframes cactus-roll{0%{left:calc(100% + 4px)}100%{left:-22px}}
+/* 恐龙: 3 只挨在左边, 大小不一. emoji 🦖/🦕 默认朝左, 用 scaleX(-1) 翻成朝右,
+   跟 cactus 移动方向(右→左)相对的方向一致 */
+.dino-track .dino{position:absolute;bottom:7px;line-height:1;will-change:transform;animation:dino-jump 4.5s cubic-bezier(0.45,0,0.55,1) infinite}
+.dino-track .d1{left:6px;font-size:18px}
+.dino-track .d2{left:26px;font-size:13px}
+.dino-track .d3{left:42px;font-size:15px}
+/* 3 次跳精确对应 cactus 经过 dino 群中心 (~26px) 的时刻:
+   cactus 经过 26px 大概在每轮的 23% / 57% / 90% (反推自 3 个 delay 错位的 cactus) */
+@keyframes dino-jump{
+  0%,18%,30%,52%,64%,86%,98%,100%{transform:scaleX(-1) translateY(0)}
+  20%,28%{transform:scaleX(-1) translateY(-15px)}
+  54%,62%{transform:scaleX(-1) translateY(-15px)}
+  88%,96%{transform:scaleX(-1) translateY(-15px)}
+}
+.nr{display:flex;align-items:center;gap:12px}
+.lp{display:flex;align-items:center;gap:5px;padding:4px 12px;background:var(--acd);border:1px solid rgba(0,229,160,0.2);border-radius:20px;font-size:10px;font-weight:600;color:var(--ac)}
+.ld{width:5px;height:5px;border-radius:50%;background:var(--ac);animation:p 2s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+.chip{font-family:'JetBrains Mono';font-size:10px;padding:4px 9px;background:var(--sf);color:var(--tx2);border:1px solid var(--bd);border-radius:14px;cursor:pointer;transition:all 0.15s;letter-spacing:0.3px}
+.chip:hover{background:var(--sf2);color:var(--tx);border-color:var(--ac)}
+.chip:active{transform:scale(0.94)}
+.chip-flash{background:var(--acd);color:var(--ac);border-color:var(--ac)}
+.tab{font-family:'Space Grotesk';font-size:12px;font-weight:500;padding:8px 16px;background:transparent;color:var(--tx3);border:none;border-bottom:2px solid transparent;cursor:pointer;transition:all 0.15s}
+.tab:hover{color:var(--tx2)}
+.tab-active{color:var(--ac);border-bottom-color:var(--ac);font-weight:600}
+.btn-primary{background:linear-gradient(135deg,#00e5a0,#00c8ff)!important;color:#060610!important;border:none!important;font-weight:600}
+.btn-primary:hover{filter:brightness(1.1);transform:translateY(-1px)}
+.rb{font-size:10px;color:var(--tx3);background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:3px 10px;font-family:'JetBrains Mono'}
+/* v5.10: 顶部页面切换 主页 / 往期仓位监测 */
+.pages-tab{display:flex;gap:6px;margin-left:20px}
+.ptab{font-size:11px;font-weight:500;padding:6px 12px;background:transparent;color:var(--tx3);border:1px solid var(--bd);border-radius:8px;cursor:pointer;text-decoration:none;transition:all 0.15s;white-space:nowrap}
+.ptab:hover{color:var(--tx);border-color:var(--bd2);background:var(--sf)}
+.ptab-active{background:var(--acd);color:var(--ac);border-color:rgba(0,229,160,0.35);font-weight:600}
+.wrap{max-width:1400px;margin:0 auto;padding:20px 20px 60px}
+.toast{position:fixed;top:70px;right:20px;padding:12px 18px;border-radius:10px;font-size:12px;z-index:200;opacity:0;transform:translateY(-10px);transition:all .3s;max-width:360px}
+.toast.show{opacity:1;transform:translateY(0)}.toast.ok{background:var(--acd);border:1px solid rgba(0,229,160,0.3);color:var(--ac)}.toast.err{background:var(--rdd);border:1px solid rgba(255,64,112,0.3);color:var(--rd)}
+.sl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:var(--tx2);margin:26px 0 12px 2px;position:relative;padding-left:12px;display:flex;align-items:center;scroll-margin-top:70px}
+.sl::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:14px;background:linear-gradient(180deg,var(--ac2),var(--vi));border-radius:2px}
+/* v5.11: 可折叠区块 (低频信息默认收起) + 统一输入框 + JSON 快速通道 */
+details.fold{border:1px solid var(--bd);border-radius:14px;background:linear-gradient(180deg,var(--sf) 0%,var(--sf2) 100%);margin-bottom:16px;scroll-margin-top:70px}
+details.fold>summary{cursor:pointer;padding:13px 18px;font-size:12px;font-weight:600;color:var(--tx2);user-select:none;list-style:none;transition:color 0.15s}
+details.fold>summary:hover{color:var(--tx)}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::before{content:'▸';color:var(--tx3);margin-right:8px}
+details.fold[open]>summary{border-bottom:1px solid var(--bd)}
+details.fold[open]>summary::before{content:'▾'}
+.inp{font-family:'JetBrains Mono';font-size:12px;padding:6px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:6px;color:var(--tx);width:100%}
+.inp:focus{outline:none;border-color:var(--ac)}
+.cj-rec{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:9px 12px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;margin-top:8px;font-size:11px}
+.cj-rec .cj-slug{font-family:'JetBrains Mono';font-size:10.5px;color:var(--ac2);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cj-rec .cj-kv{font-family:'JetBrains Mono';font-size:10.5px;color:var(--tx2)}
+.anchor-chips{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+.anchor-chips .chip{text-decoration:none;display:inline-flex;align-items:center}
+.ms{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+@media(max-width:900px){.ms{grid-template-columns:repeat(2,1fr)}}
+.m{background:linear-gradient(180deg,var(--sf) 0%,var(--sf2) 100%);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;transition:transform 0.2s,border-color 0.2s,box-shadow 0.2s}
+.m:hover{transform:translateY(-2px);border-color:var(--bd2);box-shadow:0 8px 24px rgba(0,0,0,0.3)}
+.m::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.m.g::before{background:linear-gradient(90deg,#00e5a0,#00c8ff)}.m.r::before{background:linear-gradient(90deg,#ff4070,#ff8060)}.m.b::before{background:linear-gradient(90deg,#00c8ff,#8060ff)}.m.v::before{background:linear-gradient(90deg,#8060ff,#c060ff)}
+.mi{font-size:16px;margin-bottom:8px}.ml{font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--tx3);margin-bottom:6px}
+.mv{font-size:24px;font-weight:700;font-family:'JetBrains Mono';letter-spacing:-1px}
+.msb{font-size:10px;color:var(--tx3);margin-top:6px}
+.card{background:linear-gradient(180deg,var(--sf) 0%,var(--sf2) 100%);border:1px solid var(--bd);border-radius:14px;overflow:hidden;margin-bottom:16px;transition:border-color 0.2s,box-shadow 0.2s}
+.card:hover{border-color:var(--bd2)}
+.chd{padding:14px 18px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center}
+.chd h2{font-size:12px;font-weight:600;color:var(--tx2)}.cnt{font-size:9px;padding:3px 8px;border-radius:8px;font-weight:600;font-family:'JetBrains Mono';background:var(--acd);color:var(--ac)}
+.cb{max-height:500px;overflow-y:auto;scrollbar-width:thin}.cb::-webkit-scrollbar{width:3px}.cb::-webkit-scrollbar-thumb{background:var(--bd)}
+.pos-hdr,.pos-row{padding:10px 18px;border-bottom:1px solid var(--bd);display:grid;grid-template-columns:minmax(180px,2.5fr) 40px 52px 55px 55px 45px 65px 55px 70px 240px;gap:5px;align-items:center;font-size:11px}
+.pos-hdr{font-weight:700;color:var(--tx3);font-size:10px;background:var(--sf2)}
+.pos-row:hover{background:linear-gradient(90deg,rgba(0,200,255,0.05),transparent 80%)}
+.pos-row .nm{font-weight:500;white-space:normal;word-break:break-word;line-height:1.35;padding-right:6px}
+.ar-light{display:none}
+.ar-light.on{display:inline-block;width:9px;height:9px;border-radius:50%;margin-left:6px;vertical-align:middle;animation:arblink 1s infinite}
+.ar-light.red{background:#ff4070;box-shadow:0 0 6px #ff4070}
+.ar-light.yellow{background:#ffc040;box-shadow:0 0 6px #ffc040}
+@keyframes arblink{0%,100%{opacity:1}50%{opacity:.25}}
+@keyframes urgentflash{0%,100%{opacity:1}50%{opacity:.45}}
+.pos-row .mono{font-family:'JetBrains Mono';font-size:10px}
+.pos-row .cur-value,.pos-row .cur-pnl,.pos-row .cur-pnl-d{font-size:12px;font-weight:600}
+/* v7.x (#6 后续): 当前持仓「只看」面板 — 整体放大 + 盈亏更大 + 信息彩色 chip (只圈 #pos-panel-current, 不影响操作面板) */
+#pos-panel-current .pos-hdr,#pos-panel-current .pos-row{grid-template-columns:minmax(190px,2.4fr) 48px 62px 66px 66px 52px 82px 72px 90px 262px;font-size:12px;padding:13px 18px}
+#pos-panel-current .pos-row .mono{font-size:12px}
+#pos-panel-current .pos-row .nm{font-size:13.5px;font-weight:600}
+#pos-panel-current .pos-row .cur-value{font-size:15px;font-weight:700}
+#pos-panel-current .pos-row .cur-pnl,#pos-panel-current .pos-row .cur-pnl-d{font-size:16.5px;font-weight:800}
+#pos-panel-current .monitor-state-row{padding:9px 16px}
+#pos-panel-current .ms-label{font-size:12px}
+#pos-panel-current .ms-badge{font-size:13px;padding:4px 13px}
+#pos-panel-current .vchip{font-size:11px;font-weight:700;padding:3px 9px;border-radius:7px;background:var(--sf);border:1px solid var(--bd);color:var(--tx2);white-space:nowrap}
+#pos-panel-current .vchip-q{background:rgba(0,200,255,0.14);color:#00c8ff;border-color:rgba(0,200,255,0.42)}
+#pos-panel-current .vchip-conf{background:rgba(255,192,64,0.14);color:#ffc040;border-color:rgba(255,192,64,0.42)}
+#pos-panel-current .vchip-convergent{background:rgba(0,229,160,0.14);color:#00e5a0;border-color:rgba(0,229,160,0.42)}
+#pos-panel-current .vchip-hybrid{background:rgba(255,192,64,0.14);color:#ffc040;border-color:rgba(255,192,64,0.42)}
+#pos-panel-current .vchip-event_driven{background:rgba(138,108,255,0.16);color:#a98cff;border-color:rgba(138,108,255,0.45)}
+.conf-sel{padding:2px 1px;border:1px solid var(--bd);border-radius:3px;font-size:9px;background:var(--bg2);color:var(--tx2);cursor:pointer;width:54px;margin-right:4px;height:22px}
+.conf-sel:hover{border-color:var(--ac)}
+.q-cell{display:flex;align-items:center;gap:4px}
+.q-cell .tp-input{width:48px;padding:4px 6px;font-size:11px;height:24px;text-align:center;border:1px solid var(--bd);border-radius:3px}
+.q-cell .q-pct{font-size:10px;color:var(--tx3)}
+.q-cell .conf-sel{padding:2px 4px;border:1px solid var(--bd);border-radius:3px;font-size:10px;background:var(--bg2);color:var(--tx2);cursor:pointer;height:24px;width:50px}
+.q-cell .conf-sel:hover{border-color:var(--ac)}
+.q-cell .btn-small{height:24px;padding:0 8px;font-size:11px}
+.tp-input{background:var(--bg);border:1px solid var(--bd);color:var(--ac);padding:3px 6px;border-radius:5px;font-family:'JetBrains Mono';font-size:10px;width:48px}
+.tp-input:focus{outline:none;border-color:var(--ac)}
+.btn-small{background:var(--acd);border:1px solid rgba(0,229,160,0.3);color:var(--ac);padding:3px 8px;border-radius:5px;font-size:9px;cursor:pointer;font-family:'Space Grotesk';font-weight:600;white-space:nowrap}
+.btn-small:hover{background:rgba(0,229,160,0.2)}
+.triggers{padding:8px 18px 12px 18px;border-bottom:1px solid var(--bd);background:rgba(16,16,40,0.5);display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.trig-section{display:flex;flex-direction:column;gap:3px}
+.trig-label{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--tx3);margin-bottom:4px}
+.trig-item{font-size:10px;font-family:'JetBrains Mono';padding:3px 8px;border-radius:4px;color:var(--tx2)}
+.trig-item.green{background:rgba(0,229,160,0.06);border-left:2px solid var(--ac)}
+.trig-item.red{background:rgba(255,64,112,0.06);border-left:2px solid var(--rd)}
+.trig-item b{color:var(--tx);font-weight:600}
+.reeval-cell{display:inline-flex;align-items:center}
+/* v5.8 增量: 仓位 tab + 重评模式 */
+.pos-tabs{display:flex;gap:4px;padding:10px 18px 0;background:var(--sf);border-bottom:1px solid var(--bd)}
+.pos-tab{font-family:'Space Grotesk';font-size:11px;font-weight:500;padding:7px 14px;background:transparent;border:1px solid var(--bd);border-bottom:none;border-radius:6px 6px 0 0;color:var(--tx2);cursor:pointer;transition:all 0.15s}
+.pos-tab:hover{color:var(--tx)}
+.pos-tab.pos-tab-active{background:var(--bg);color:var(--ac);border-color:var(--ac);position:relative;top:1px}
+.reeval-row{padding:10px 18px;border-bottom:1px solid var(--bd);display:grid;grid-template-columns:1fr 180px;gap:10px;align-items:center;font-size:11px}
+.reeval-row:hover{background:linear-gradient(90deg,rgba(255,180,0,0.05),transparent 80%)}
+.reeval-row .rv-title{font-weight:500;line-height:1.35}
+.reeval-row .rv-meta{font-size:10px;color:var(--tx3);font-family:'JetBrains Mono';margin-top:3px}
+.reeval-copy-btn{font-family:'Space Grotesk';font-size:11px;font-weight:600;padding:8px 14px;background:var(--sf);border:1px solid var(--bd);border-radius:14px;color:var(--tx);cursor:pointer;transition:all 0.15s}
+.reeval-copy-btn:hover{transform:translateY(-1px);border-color:var(--ac);color:var(--ac)}
+.reeval-copy-btn.ready{background:rgba(0,229,160,0.12);border-color:rgba(0,229,160,0.55);color:#00e5a0}
+.reeval-copy-btn.ready::before{content:"✓ "}
+.reeval-badge{font-family:'Space Grotesk';font-size:10px;padding:5px 10px;border-radius:14px;border:1px solid;cursor:pointer;transition:all 0.15s;letter-spacing:0.2px}
+.reeval-badge.pending{background:rgba(255,180,0,0.15);color:#ffb400;border-color:#ffb400;cursor:pointer;animation:reevalPulse 2s ease-in-out infinite}
+.reeval-badge.pending:hover{background:rgba(255,180,0,0.3);transform:translateY(-1px)}
+.reeval-badge.done{background:rgba(120,120,120,0.1);color:var(--tx3);border-color:var(--bd);cursor:default;font-size:9px}
+@keyframes reevalPulse{0%,100%{opacity:1}50%{opacity:0.6}}
+.reeval-menu{margin:6px 0 12px 18px;padding:10px 14px;background:rgba(255,180,0,0.06);border-left:3px solid #ffb400;border-radius:6px;display:flex;flex-direction:column;gap:8px}
+.reeval-menu-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.btn-danger{background:rgba(255,64,112,0.1);color:#ff4070;border:1px solid #ff4070}
+.btn-danger:hover{background:rgba(255,64,112,0.2)}
+.conf-sel{padding:3px 6px;border:1px solid var(--bd);border-radius:4px;font-size:11px;background:var(--bg2);color:var(--tx2);cursor:pointer;height:26px;width:60px}
+.conf-sel:hover{border-color:var(--ac)}
+.monitor-state-row{padding:6px 14px;display:flex;align-items:center;gap:6px;background:rgba(0,168,132,0.04);border-left:3px solid var(--ac);margin:6px 0 12px 18px;border-radius:4px}
+.ms-label{font-size:10px;color:var(--tx3);font-weight:600}
+.ms-badge{font-family:'JetBrains Mono';font-size:11px;padding:3px 9px;border-radius:11px;font-weight:600;letter-spacing:0.3px}
+.ms-HOLD{background:rgba(150,150,150,0.15);color:#666}
+.ms-MARGINAL{background:rgba(255,180,0,0.12);color:#cc9900}
+.ms-SOFT_NEGATIVE{background:rgba(140,220,170,0.22);color:#3a8a5a}
+.ms-AT_TARGET{background:rgba(0,229,160,0.2);color:#00a884;animation:reevalPulse 2s ease-in-out infinite}
+.ms-PENDING_REEVAL{background:rgba(255,160,0,0.18);color:#e08800;animation:reevalPulse 1.5s ease-in-out infinite}
+.ms-TIME_STOP{background:rgba(180,80,0,0.15);color:#b05000}
+.ms-STOP_LOSS{background:rgba(180,0,0,0.22);color:#b00000;font-weight:600}
+.ms-TAKE_PROFIT_PRICE{background:rgba(0,200,140,0.25);color:#008055;font-weight:600}
+.ms-TAKE_PROFIT_PNL{background:rgba(0,200,140,0.25);color:#008055;font-weight:600}
+.reeval-dot{position:absolute;top:-3px;right:-3px;width:8px;height:8px;background:#ff9800;border-radius:50%;border:1.5px solid white;animation:reevalPulse 1.5s ease-in-out infinite;box-shadow:0 0 4px rgba(255,152,0,0.6)}
+.reeval-panel{margin:0 18px 12px 18px;padding:10px 14px;background:rgba(0,168,132,0.05);border:1px solid rgba(0,168,132,0.2);border-radius:6px;animation:fadeIn 0.2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+.rv-grid{display:flex;gap:18px;flex-wrap:wrap}
+.rv-step{flex:1;min-width:240px}
+.rv-step-title{font-size:11px;font-weight:600;color:var(--tx2);margin-bottom:6px}
+.rv-hint{font-size:10px;color:var(--tx3);margin-top:4px}
+.rv-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.newq-inp{width:80px;padding:4px 8px;border:1px solid var(--bd);border-radius:4px;font-size:12px}
+.btn-warn{background:#ff9800;color:white}
+.btn-warn:hover{background:#f57c00}
+.ms-clickable{cursor:pointer;transition:all 0.15s}
+.ms-clickable:hover{transform:scale(1.05);box-shadow:0 2px 6px rgba(0,0,0,0.15)}
+.ms-PENDING{background:rgba(120,120,120,0.08);color:#999}
+.ms-NO_META{background:rgba(120,120,120,0.08);color:#999}
+.triggers-empty{padding:8px 18px;font-size:10px;color:var(--tx3);font-style:italic;border-bottom:1px solid var(--bd);background:rgba(16,16,40,0.3)}
+@media(max-width:900px){.triggers{grid-template-columns:1fr}}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:8px;font-weight:700;text-transform:uppercase}
+.tag-sell{background:var(--rdd);color:var(--rd)}.tag-info{background:var(--acd);color:var(--ac)}.tag-error{background:var(--rdd);color:var(--rd)}
+.tag-auto_sell{background:rgba(255,64,112,0.16);color:var(--rd);border:1px solid rgba(255,64,112,0.4)}
+.tag-auto_sell.is-tp{background:rgba(0,200,120,0.16);color:#00a866;border-color:rgba(0,200,120,0.45)}
+.tag-user_sell{background:var(--rdd);color:var(--rd)}
+.tag-update_q{background:rgba(255,192,64,0.12);color:var(--am)}
+.tag-reeval{background:rgba(128,96,255,0.14);color:var(--vi)}
+.tag-scan{background:rgba(0,200,255,0.12);color:var(--ac2)}
+.tag-scan_tag{background:rgba(0,200,255,0.12);color:var(--ac2)}
+.rules{padding:18px 22px}
+.rule{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(30,30,74,0.3);font-size:13px}
+.rule:last-child{border-bottom:none}.rule .k{color:var(--tx3)}.rule .v{font-family:'JetBrains Mono';font-weight:500;color:var(--ac)}.rule .v.red{color:var(--rd)}
+.pbox{background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:14px;font-family:'JetBrains Mono';font-size:10px;line-height:1.6;color:var(--tx2);max-height:300px;overflow-y:auto;white-space:pre-wrap;margin:12px 18px 18px}
+.btn{padding:8px 16px;border-radius:8px;border:1px solid var(--bd);background:var(--sf2);color:var(--tx2);font-family:'Space Grotesk';font-size:11px;font-weight:600;cursor:pointer;transition:all .15s}
+/* v7.x (#15): 操作按钮栏 (从 nav 移下来) — 不同色 + flex-wrap 绝不重叠 */
+.op-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.opbtn{padding:7px 15px;border-radius:9px;border:1px solid var(--bd);background:var(--sf2);color:var(--tx2);font-family:'Space Grotesk';font-size:11.5px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
+.opbtn:hover{transform:translateY(-1px);filter:brightness(1.12)}
+.opbtn.stop{background:rgba(255,64,112,0.16);color:#ff5d7e;border-color:rgba(255,64,112,0.5)}
+.opbtn.panel{background:rgba(138,108,255,0.16);color:#a98cff;border-color:rgba(138,108,255,0.5)}
+.opbtn.api{background:rgba(0,200,255,0.14);color:#00c8ff;border-color:rgba(0,200,255,0.45)}
+.opbtn.pres{background:var(--sf2);color:var(--tx2);border-color:var(--bd)}
+@media(max-width:1120px){.dino-track{min-width:120px;margin-right:8px}}
+@media(max-width:860px){.dino-track{display:none}}
+.btn:hover{border-color:var(--ac);color:var(--ac);background:var(--acd)}.btn.d:hover{border-color:var(--rd);color:var(--rd)}
+.ctrls{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.g2{grid-template-columns:1fr}}
+.lr{padding:8px 18px;border-bottom:1px solid rgba(30,30,74,0.5);font-size:10px;display:grid;grid-template-columns:60px 50px 1fr;gap:8px;align-items:start}
+.lr:hover{background:linear-gradient(90deg,rgba(0,200,255,0.04),transparent 80%)}.lr:last-child{border-bottom:none}
+.lr .lt{font-family:'JetBrains Mono';font-size:9px;color:var(--tx3)}.lr .ldd{color:var(--tx2);line-height:1.4}
+.ll{background:linear-gradient(180deg,var(--sf0) 0%,var(--bg) 100%);border:1px solid var(--bd);border-radius:14px;overflow:hidden}
+.ll .chd{background:var(--sf)}
+.lc{height:560px;overflow-y:auto;padding:10px 14px;font-family:'JetBrains Mono';font-size:10px;line-height:1.7;scrollbar-width:thin}.lc::-webkit-scrollbar{width:3px}.lc::-webkit-scrollbar-thumb{background:var(--bd)}
+.ll2{padding:1px 0}.ll2 .ts{color:var(--tx3)}.ll2 .INFO{color:var(--ac2)}.ll2 .WARNING{color:var(--am)}.ll2 .ERROR{color:var(--rd)}.ll2 .msg{color:var(--tx2)}
+.events-big .chd{padding:18px 22px}
+.events-big .chd h2{font-size:14px}
+.events-big .chd .cnt{font-size:10px;padding:4px 10px}
+.events-big .lr{padding:14px 20px;font-size:12px;grid-template-columns:130px 110px 1fr;gap:14px;align-items:start}
+.events-big .lr .lt{font-size:11px;color:var(--tx2);font-weight:500;font-family:'JetBrains Mono'}
+.events-big .lr .ldd{font-size:12px;line-height:1.5;color:var(--tx)}
+.events-big .lr .tag{font-size:10px;padding:4px 10px;border-radius:6px;letter-spacing:0.5px}
+.ev-title{font-size:12px;font-weight:600;color:var(--tx);margin-bottom:5px;line-height:1.4}
+.ev-detail{font-size:11px;color:var(--tx2);line-height:1.5;font-family:'JetBrains Mono';word-break:break-word}
+.ev-state{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;margin-right:6px;letter-spacing:0.4px}
+.ev-state.tp-price{background:rgba(0,200,140,0.18);color:#008055}
+.ev-state.tp-pnl{background:rgba(0,200,140,0.18);color:#008055}
+.ev-state.sl{background:rgba(255,64,112,0.18);color:#b00000}
+.ev-state.ts{background:rgba(180,80,0,0.18);color:#b05000}
+.ev-state.force-exit{background:rgba(128,96,255,0.18);color:#5040b0}
+.ev-state.at-target{background:rgba(0,229,160,0.18);color:#00a884}
+.ev-num{color:#00c8ff;font-weight:600}
+/* 默认只显示 sell 类, 其他 (scan_tag / update_q / discovery / etc) 隐藏.
+   只 scope 到 #events-card 容器, 不影响其他 events-big 风格区域. */
+#events-card:not(.show-all) .ev-row:not(.ev-auto_sell):not(.ev-user_sell){display:none}
+.ev-line{display:flex;gap:8px;font-size:11px;line-height:1.6;margin-top:3px;flex-wrap:wrap}
+.ev-line .ev-key{color:var(--tx3);font-weight:600;min-width:48px;font-size:10px;text-transform:uppercase;letter-spacing:0.4px}
+.ev-line .ev-v{color:var(--tx);font-family:'JetBrains Mono';word-break:break-word;flex:1}
+/* 卖出事件压紧版: state/size/detail 一行, 跟在 title 下面 */
+.ev-inline{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:11px;line-height:1.5;margin-top:2px}
+.ev-inline .sep{color:var(--tx3);font-size:11px}
+.ev-inline .ev-detail-mini{color:var(--tx2);font-family:'JetBrains Mono';font-size:10.5px;word-break:break-word;flex:1;min-width:200px}
+.events-big .lr{padding:10px 18px}  /* 减小 padding 压紧 */
+.events-toolbar{display:flex;gap:6px;align-items:center}
+.events-toolbar .btn-small{font-size:10px;padding:4px 10px}
+/* v5.11: sell-card CSS 已随 section 迁去 /history (HISTORY_HTML 有独立副本), 主页删除 */
+.ev-pnl-pos{color:#00a884;font-weight:600}
+.ev-pnl-neg{color:#b00000;font-weight:600}
+.range-btn{padding:4px 10px;border:1px solid var(--bd);background:transparent;color:var(--tx3);border-radius:6px;cursor:pointer;font-size:11px;font-family:'JetBrains Mono';letter-spacing:0.5px}
+.range-btn:hover{border-color:var(--ac2);color:var(--ac2)}
+.range-btn.active{background:rgba(0,200,255,0.1);border-color:#00c8ff;color:#00c8ff}
+#portfolio-canvas{display:block;width:100%!important;height:100%!important}
+.emp{padding:40px;text-align:center;color:var(--tx3);font-size:11px}
+footer{text-align:center;padding:20px;font-size:10px;color:var(--tx3)}
+</style>
+</head>
+<body>
+<nav><div class="nl"><div class="logo">P</div><div class="nt">Polymarket <span>{{ ver }}</span></div><div class="dino-track" title="Chrome 离线小恐龙 — 恐龙家族躲仙人掌"><span class="ground"></span><span class="cactus c1">🌵</span><span class="cactus c2">🌵</span><span class="cactus c3">🌵</span><span class="dino d1">🦖</span><span class="dino d2">🦕</span><span class="dino d3">🦖</span></div><div class="pages-tab"><a href="/" class="ptab ptab-active">🏠 主页</a><a href="/history" class="ptab">📊 往期仓位监测</a><a href="/tags" class="ptab">🏷️ 标签</a><a href="/paper" class="ptab">🧪 测试仓</a><a href="/api_reeval" class="ptab">🔬 API重评</a><a href="/m" class="ptab">📱 手机版</a></div></div></nav>
+<div id="pres-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;align-items:center;justify-content:center">
+<div style="background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:24px 28px;text-align:center;max-width:320px">
+<div style="font-size:15px;font-weight:600;margin-bottom:8px">你还在吗?</div>
+<div style="font-size:12px;color:var(--tx3);margin-bottom:16px"><span id="pres-countdown">60</span> 秒内不点就转为"不在线", 自动 API 会接管</div>
+<button class="btn btn-primary btn-small" onclick="presStillHere()">✅ 我在</button>
+</div>
+</div>
+<div id="urgent-pop" style="display:none;position:fixed;top:70px;left:50%;transform:translateX(-50%);z-index:9998;background:#2a0d14;border:2px solid #ff4070;border-radius:10px;padding:12px 18px;box-shadow:0 0 20px rgba(255,64,112,0.6);animation:urgentflash 0.8s infinite">
+<span id="urgent-pop-text" style="color:#ff6080;font-weight:700;font-size:13px"></span>
+<button class="btn-small" style="margin-left:12px" onclick="document.getElementById('urgent-pop').style.display='none'">知道了</button>
+</div>
+<div id="toast" class="toast"></div>
+<div class="wrap">
+<div class="ctrls">
+<div class="op-row">
+<button class="opbtn stop" onclick="if(confirm('停止 monitor?'))doAction('stop')" title="停止 monitor 心跳">⏹ 停止</button>
+<button class="opbtn panel" onclick="window.open('/panel','panel','width=1240,height=940')" title="打开副屏总控台小窗">🖥️ 控制台</button>
+<button id="apimode-btn" class="opbtn api" onclick="apiModeToggle()" title="🛑 紧急: 暂停/恢复 所有自动重评 API (auto触发 + 手动🤖 + 离线执行 全停)">🤖 API</button>
+<button id="pres-btn" class="opbtn pres" onclick="presToggle()" title="在线=暂停自动API重评(改手动省钱); 离线=自动API接管">⚪ 不在线</button>
+<div class="lp"><div class="ld"></div>监控中</div>
+<div class="rb" id="rb">30s</div>
+</div>
+<div class="anchor-chips">
+<a class="chip" href="#sec-size">入场金额</a>
+<a class="chip" href="#sec-pos">持仓</a>
+<a class="chip" href="#sec-events">事件</a>
+<a class="chip" href="#sec-log">日志</a>
+</div>
+</div>
+<div class="ms">
+<div class="m {{ 'g' if total_pnl >= 0 else 'r' }}"><div class="mi">💰</div><div class="ml">总盈亏</div><div class="mv" id="m-pnl" style="color:{{ '#00e5a0' if total_pnl >= 0 else '#ff4070' }}">${{ "%.2f"|format(total_pnl) }}</div><div class="msb">所有持仓</div></div>
+<div class="m b"><div class="mi">📦</div><div class="ml">持仓数</div><div class="mv" id="m-count">{{ positions|length }}</div><div class="msb">活跃标的</div></div>
+<div class="m v"><div class="mi">💵</div><div class="ml">总投入</div><div class="mv" id="m-cost" style="font-size:18px">${{ "%.2f"|format(total_cost) }}</div><div class="ml" style="margin-top:8px">总收入</div><div class="mv" id="m-revenue" style="color:#00c8ff;font-size:18px">${{ "%.2f"|format(total_value) }}</div></div>
+<div class="m b"><div class="mi">💼</div><div class="ml">资产组合</div><div class="mv" id="m-portfolio" style="color:#00c8ff;font-size:18px">${{ "%.2f"|format(assets_total) }}</div><div class="ml" style="margin-top:8px">现金</div><div class="mv" id="m-cash" style="color:#ffc040;font-size:18px">${{ "%.2f"|format(cash) }}</div></div>
+</div>
+<div class="sl">📈 资产总值曲线</div>
+<div class="card" style="padding:18px">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;gap:12px;flex-wrap:wrap">
+<div style="flex:1;min-width:260px">
+<div id="chart-delta" style="font-size:26px;font-weight:700;font-family:'JetBrains Mono';color:#00c8ff;letter-spacing:-0.5px;line-height:1.1">$0.00</div>
+<div id="chart-delta-label" style="font-size:10px;color:var(--tx2);margin-top:3px">数值 = 当前组合 − 起点组合</div>
+<div style="font-size:9px;color:var(--tx3);margin-top:6px;font-family:'JetBrains Mono';letter-spacing:0.2px">组合 = SUM(SELL+REDEEM+MERGE+REBATE) − SUM(BUY+SPLIT) + 持仓市值</div>
+</div>
+<div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+<button class="range-btn active" data-range="1d" onclick="loadChart('1d')">1D</button>
+<button class="range-btn" data-range="1w" onclick="loadChart('1w')">1W</button>
+<button class="range-btn" data-range="1m" onclick="loadChart('1m')">1M</button>
+<button class="range-btn" data-range="1y" onclick="loadChart('1y')">1Y</button>
+<button class="range-btn" data-range="ytd" onclick="loadChart('ytd')">YTD</button>
+<button class="range-btn" data-range="all" onclick="loadChart('all')">ALL</button>
+</div>
+</div>
+<div style="position:relative;height:260px"><canvas id="portfolio-canvas"></canvas></div>
+</div>
+
+<!-- v5.9: 入场金额建议面板; v5.11: + Claude JSON 快速通道 -->
+<div class="sl" id="sec-size">💵 入场金额建议</div>
+<div class="card">
+<div style="padding:14px 18px;border-bottom:1px solid var(--bd);background:rgba(0,229,160,0.04)">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+<span style="font-size:12px;font-weight:600;color:var(--ac)">🤖 Claude JSON 快速通道</span>
+<span style="font-size:10px;color:var(--tx3)">把 DISCOVERY 输出末尾的 ```json 块整段粘进来 → 一键填表算金额; 买完后还能一键把 q/信心/止损/cluster/tag 全部录到持仓</span>
+</div>
+<div style="display:flex;gap:8px;align-items:stretch;flex-wrap:wrap">
+<textarea id="cj-paste" class="inp" placeholder='粘贴 Claude 输出的 json 块 (带不带 ```json 标记都行, 周围多余文字会自动忽略)' style="flex:1;min-width:300px;height:58px;resize:vertical;font-size:11px;line-height:1.5"></textarea>
+<button class="btn btn-primary" style="align-self:center" onclick="cjParse()">✨ 解析</button>
+<button class="btn" style="align-self:center" onclick="cjClear()" title="清空快速通道 + 推荐金额, 并清除浏览器里保存的草稿">🗑 清理</button>
+</div>
+<div id="cj-recs"></div>
+</div>
+<div class="chd"><h2>手动模式: 把 Claude 推荐的 q/方向/tier/cluster 填进来, 公式实时算建议下注金额</h2></div>
+<div class="cb" style="padding:14px 18px">
+<div style="display:grid;grid-template-columns:repeat(6,1fr) auto;gap:8px;align-items:end;margin-bottom:10px">
+<label style="font-size:10px;color:var(--tx3)">q (你的概率 %)<input type="number" id="sg-q" step="0.1" placeholder="84" style="width:100%;font-family:'JetBrains Mono';font-size:12px;padding:6px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx)"/></label>
+<label style="font-size:10px;color:var(--tx3)">p (市场价 %)<input type="number" id="sg-p" step="0.1" placeholder="70" style="width:100%;font-family:'JetBrains Mono';font-size:12px;padding:6px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx)"/></label>
+<label style="font-size:10px;color:var(--tx3)">conf<select id="sg-conf" style="width:100%;font-family:'Space Grotesk';font-size:12px;padding:6px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx)"><option value="high">high</option><option value="medium" selected>medium</option><option value="low">low</option></select></label>
+<label style="font-size:10px;color:var(--tx3)">tier<select id="sg-tier" style="width:100%;font-family:'Space Grotesk';font-size:12px;padding:6px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx)"><option value="convergent">convergent</option><option value="hybrid" selected>hybrid</option><option value="event_driven">event_driven</option></select></label>
+<label style="font-size:10px;color:var(--tx3)">距结算天<input type="number" id="sg-days" step="1" placeholder="29" style="width:100%;font-family:'JetBrains Mono';font-size:12px;padding:6px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx)"/></label>
+<label style="font-size:10px;color:var(--tx3)">cluster_id<input type="text" id="sg-cluster" placeholder="iran-deescalation-no" style="width:100%;font-family:'JetBrains Mono';font-size:11px;padding:6px 8px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx)"/></label>
+<button class="btn btn-primary" onclick="calcSize()">💵 算</button>
+</div>
+<div id="sg-result" style="font-family:'JetBrains Mono';font-size:11px;color:var(--tx2);padding:10px 14px;background:var(--bg);border:1px solid var(--bd);border-radius:6px;min-height:50px">输入参数后点 "算" 看推荐. 已上仓: <span id="sg-context-bankroll">—</span> · DD 余预算: <span id="sg-context-dd">—</span></div>
+</div>
+</div>
+
+<!-- v5.13: 大跌自动重评建议 (联网调研 → 等你确认才执行) -->
+<div class="sl">🔬 自动重评建议 <span style="font-size:11px;color:var(--tx3);font-weight:400">(亏 &gt;30% 自动联网调研; 每仓只跑一次, 清空后才会再触发; 不自动卖)</span></div>
+<div class="card">
+<div class="cb" style="padding:12px 16px">
+<div id="ar-head" style="display:none;justify-content:flex-end;margin-bottom:8px"><button class="btn-small" onclick="arClearAll()" title="清空整个清单. 是否再自动评由 6h冷却控制, 跟清空无关.">🗑 全部清空</button></div>
+<div id="ar-list" style="display:flex;flex-direction:column;gap:10px"></div>
+<div id="ar-empty" style="color:var(--tx3);font-size:12px">暂无待确认建议。仓位亏损 &gt;30% 时会自动联网调研并在这里弹出建议。</div>
+<div style="margin-top:12px;border-top:1px solid var(--bd);padding-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<span style="font-size:11px;color:var(--tx3)">🧪 测试整个流程:</span>
+<select id="ar-test-sel" class="conf-sel" style="max-width:300px">{% for p in positions %}<option value="{{ p.asset }}">{{ p.title[:42] }}</option>{% endfor %}</select>
+<button class="btn-small" onclick="arTestTrigger()">🔬 立刻跑一次</button>
+<span id="ar-test-msg" style="font-size:11px;color:var(--ac)"></span>
+</div>
+</div>
+</div>
+
+<!-- v6.0.6: 重评历史 (已清空归档, 不会丢) + 冷却倒计时 -->
+<details id="ar-hist-wrap" style="margin:4px 0 4px">
+<summary style="cursor:pointer;color:var(--tx2);font-size:12.5px;padding:7px 2px;user-select:none">📜 重评历史 &amp; 冷却状态 <span id="ar-hist-cnt" style="color:var(--tx3);font-weight:400"></span></summary>
+<div class="card"><div class="cb" style="padding:11px 15px">
+<div style="font-size:11px;color:var(--tx3);margin-bottom:9px">清空的建议都归档在这里, 决策 / reason / 来源 / 信心 全保留, 不会丢。<b>冷却</b> = 自动评过一次后, 多久才会再自动评 (默认 <span id="ar-hist-h">6</span>h; 过了之后还要从基线再跌 <span id="ar-hist-pp">10</span>pp 才触发)。</div>
+<div id="ar-hist-list" style="display:flex;flex-direction:column;gap:8px"></div>
+<div id="ar-hist-empty" style="color:var(--tx3);font-size:12px">暂无历史记录。清空一条建议后, 它会归档到这里。</div>
+</div></div>
+</details>
+
+<div class="sl" id="sec-pos">📦 持仓详情</div>
+<div class="card"><div class="chd"><h2>当前持仓 (填 q + 信心 + 止损档)</h2><span class="cnt">{{ positions|length }}</span></div>
+<!-- v5.8 + v5.9: 持仓 tab 切换 (当前持仓 / 重评模式 / Cluster 分析) -->
+<div class="pos-tabs">
+<button class="pos-tab pos-tab-active" id="ptab-current" onclick="switchPosTab('current')">📦 当前持仓 (只看)</button>
+<button class="pos-tab" id="ptab-ops" onclick="switchPosTab('ops')">⚙️ 重评操作 ({{ positions|length }})</button>
+<button class="pos-tab" id="ptab-reeval" onclick="switchPosTab('reeval')">🤖 重评模式 ({{ positions|length }})</button>
+<button class="pos-tab" id="ptab-cluster" onclick="switchPosTab('cluster')">🧠 Cluster 分析</button>
+</div>
+
+<!-- v7.x (#6): 当前持仓 = 纯只看面板 (放最前 → updatePositions 第一个匹配, 吃实时价). 编辑/操作全在「⚙️ 重评操作」tab. 用 .pos-row 但无 data-slug → cjApplyPos 只认操作面板, 不冲突. -->
+<div id="pos-panel-current" class="cb">
+<div class="pos-hdr">
+<span>名称</span><span>方向</span><span>距结算</span><span>入场价</span><span>当前价</span><span>份数</span><span>当前价值</span><span>盈亏%</span><span>盈亏$</span><span>q · 信心 · 止损</span>
+</div>
+{% for p in positions %}
+{% set pd = (p.cur_price - p.avg_price) * p.size %}
+<div class="pos-row" data-asset="{{ p.asset }}">
+<span class="nm">{{ p.title }}{% if p.meta and p.meta.autostop_disabled %} <span style="font-size:10px;color:#ff4070;font-weight:700" title="该仓自动止损已取消, 只留 $0.05 地板兜底">🛑止损OFF</span>{% endif %}<span class="ar-light" data-asset="{{ p.asset }}"></span></span>
+<span class="mono" style="color:{{ '#00a884' if p.side|upper == 'YES' else '#cc3050' }};font-weight:600">{{ p.side }}</span>
+<span class="mono" style="color:var(--tx3)" title="距结算天数">{% if p.days_left is not none %}{{ p.days_left }}天{% else %}—{% endif %}</span>
+<span class="mono" style="color:#8060ff">${{ "%.3f"|format(p.avg_price) }}</span>
+<span class="mono cur-price" style="color:#00c8ff">${{ "%.3f"|format(p.cur_price) }}</span>
+<span class="mono" style="color:#ffc040">{{ "%.1f"|format(p.size) }}</span>
+<span class="mono cur-value" style="color:{{ '#00e5a0' if pd >= 0 else '#ff4070' }}">${{ "%.2f"|format(p.cur_price * p.size) }}</span>
+<span class="mono cur-pnl" style="color:{{ '#00e5a0' if p.pnl_pct >= 0 else '#ff4070' }}">{{ "%+.1f"|format(p.pnl_pct) }}%</span>
+<span class="mono cur-pnl-d" style="color:{{ '#00e5a0' if pd >= 0 else '#ff4070' }}">{{ '+' if pd >= 0 else '-' }}${{ "%.2f"|format(pd|abs) }}</span>
+<span style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">{% if p.meta and (p.meta.new_tp or p.meta.tp) %}<span class="vchip vchip-q">q {{ ((p.meta.new_tp or p.meta.tp)*100)|round|int }}%</span>{% else %}<span class="vchip" style="opacity:.45">q —</span>{% endif %}{% if p.meta and p.meta.original_confidence %}<span class="vchip vchip-conf">信心{{ {'high':'高','medium':'中','low':'低'}.get(p.meta.original_confidence, p.meta.original_confidence) }}</span>{% endif %}{% if p.meta and p.meta.stop_loss_tier %}<span class="vchip vchip-{{ p.meta.stop_loss_tier }}">{{ {'convergent':'收敛-20%','hybrid':'混合-35%','event_driven':'事件$0.05'}.get(p.meta.stop_loss_tier, p.meta.stop_loss_tier) }}</span>{% endif %}</span>
+</div>
+{% if p.meta and p.meta.monitor_state %}
+<div class="monitor-state-row">
+<span class="ms-label">决策状态:</span>
+{% if p.meta.monitor_state == "PENDING_REEVAL" %}<span class="ms-badge ms-PENDING_REEVAL">⏸ 等重评 · 暂不止损</span>{% else %}<span class="ms-badge ms-{{ p.meta.monitor_state }}">{{ p.meta.monitor_state }}</span>{% endif %}
+</div>
+{% endif %}
+{% endfor %}
+{% if not positions %}<div class="emp">暂无持仓</div>{% endif %}
+</div>
+
+<!-- v5.9: Cluster 分析 panel (默认 hidden) -->
+<div id="pos-panel-cluster" class="cb" style="display:none">
+<div style="padding:10px 18px;display:flex;gap:10px;align-items:center;background:rgba(0,200,255,0.05);border-bottom:1px solid var(--bd);flex-wrap:wrap">
+<button class="btn btn-primary" onclick="copyClusterAnalysisPrompt()">🤖 一键复制给 Claude 分析</button>
+<span style="font-size:10px;color:var(--tx3)">复制后粘到 Claude.ai (已上传 polymarket-cluster-analyzer skill), Claude 返回 cluster_id 表, 填进下方 input 保存.</span>
+</div>
+<!-- 当前 cluster 暴露统计 -->
+<div id="cluster-summary" style="padding:8px 18px;font-size:11px;color:var(--tx3);border-bottom:1px solid var(--bd);font-family:'JetBrains Mono'"></div>
+{% for p in positions %}
+<div class="reeval-row cluster-row" data-asset="{{ p.asset }}">
+<div>
+<div class="rv-title">{{ p.title }}
+<span style="margin-left:8px;color:{{ '#00a884' if p.side|upper == 'YES' else '#cc3050' }};font-size:11px;font-weight:600">{{ p.side }}</span>
+<span style="margin-left:10px;color:{{ '#00e5a0' if p.pnl_pct >= 0 else '#ff4070' }};font-size:11px;font-weight:600">{{ "%+.1f"|format(p.pnl_pct) }}%</span>
+</div>
+<div class="rv-meta">avg ${{ "%.3f"|format(p.avg_price) }} · cur ${{ "%.3f"|format(p.cur_price) }} · q {{ ((p.meta.new_tp or p.meta.tp or 0)*100)|round|int }}%{% if p.meta.stop_loss_tier %} · {{ p.meta.stop_loss_tier }}{% endif %}</div>
+</div>
+<div style="display:flex;gap:6px;align-items:center">
+<input type="text" class="cluster-input" data-asset="{{ p.asset }}" placeholder="topic-direction" value="{{ p.meta.cluster_id or '' }}" style="font-family:'JetBrains Mono';font-size:11px;padding:6px 10px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;color:var(--tx);width:170px" />
+<button class="btn-small" onclick="saveCluster(this, '{{ p.asset }}')">保存</button>
+</div>
+</div>
+{% endfor %}
+{% if not positions %}<div style="padding:20px;color:var(--tx3);font-size:11px;text-align:center">暂无持仓</div>{% endif %}
+</div>
+
+<!-- 重评模式 panel (默认 hidden) -->
+<div id="pos-panel-reeval" class="cb" style="display:none">
+<div style="padding:10px 18px;display:flex;gap:10px;align-items:center;background:rgba(255,180,0,0.05);border-bottom:1px solid var(--bd)">
+<button class="btn btn-primary" onclick="reevalReadyAll()" id="reeval-ready-all-btn">🤖 一键全部就绪</button>
+<button class="btn" onclick="reevalResetMarks()" title="清掉所有 ✓ 标记 (按钮回原样)">🔄 重置标记</button>
+<span style="font-size:10px;color:var(--tx3);margin-left:auto">点 📋 即复制该仓位的重评 prompt; 复制完 ✓ 自动消失</span>
+</div>
+{% for p in positions %}
+<div class="reeval-row" data-asset="{{ p.asset }}">
+<div>
+<div class="rv-title">{{ p.title }}
+<span style="margin-left:8px;color:{{ '#00a884' if p.side|upper == 'YES' else '#cc3050' }};font-size:11px;font-weight:600">{{ p.side }}</span>
+<span style="margin-left:10px;color:{{ '#00e5a0' if p.pnl_pct >= 0 else '#ff4070' }};font-size:11px;font-weight:600">{{ "%+.1f"|format(p.pnl_pct) }}%</span>
+</div>
+<div class="rv-meta">avg ${{ "%.3f"|format(p.avg_price) }} · cur ${{ "%.3f"|format(p.cur_price) }} · q {{ ((p.meta.new_tp or p.meta.tp or 0)*100)|round|int }}%{% if p.meta.stop_loss_tier %} · tier {{ p.meta.stop_loss_tier }}{% endif %} · 距结算 {{ p.meta.end_date[:10] if p.meta.end_date else '?' }}</div>
+</div>
+<button class="reeval-copy-btn" data-asset="{{ p.asset }}" onclick="copyReevalPromptMarked(this, '{{ p.asset }}')">📋 复制 Prompt</button>
+</div>
+{% endfor %}
+{% if not positions %}<div style="padding:20px;color:var(--tx3);font-size:11px;text-align:center">暂无持仓</div>{% endif %}
+</div>
+
+<!-- 当前持仓 panel (默认显示) -->
+<div id="pos-panel-ops" class="cb" style="display:none">
+<div style="padding:8px 18px;font-size:11px;color:var(--tx3);background:rgba(138,108,255,0.05);border-bottom:1px solid var(--bd)">⚙️ 这里是<b style="color:#a98cff">操作区</b>: 填 q/信心/止损 · 加仓/清仓 · API重评 · 止盈止损开关 · 粘 Claude 重评 JSON 一键应用。只看请切「📦 当前持仓」。</div>
+<div class="pos-hdr">
+<span>名称</span><span>方向</span><span>距结算</span><span>入场价</span><span>当前价</span><span>份数</span><span>当前价值</span><span>盈亏%</span><span>盈亏$</span><span>q + 信心 + 止损 + 保存</span>
+</div>
+{% for p in positions %}
+<div class="pos-row" data-asset="{{ p.asset }}" data-slug="{{ p.market_slug }}" data-side="{{ p.side }}" data-avg="{{ p.avg_price }}" data-size="{{ p.size }}" data-end="{{ p.end_date }}" data-idx="{{ loop.index0 }}">
+{% set pd = (p.cur_price - p.avg_price) * p.size %}<span class="nm">{{ p.title }} <span id="slbadge-{{ p.asset }}" style="font-size:10px;color:#ff4070;font-weight:700;{% if not (p.meta and p.meta.autostop_disabled) %}display:none{% endif %}" title="该仓自动止损已取消, 只留 $0.05 地板兜底">🛑止损OFF</span><span class="ar-light" data-asset="{{ p.asset }}"></span></span>
+<span class="mono" style="color:{{ '#00a884' if p.side|upper == 'YES' else '#cc3050' }};font-weight:600">{{ p.side }}</span>
+<span class="mono" style="color:var(--tx3)" title="距结算天数">{% if p.days_left is not none %}{{ p.days_left }}天{% else %}—{% endif %}</span>
+<span class="mono" style="color:#8060ff">${{ "%.3f"|format(p.avg_price) }}</span>
+<span class="mono cur-price" style="color:#00c8ff">${{ "%.3f"|format(p.cur_price) }}</span>
+<span class="mono" style="color:#ffc040">{{ "%.1f"|format(p.size) }}</span>
+<span class="mono cur-value" style="color:{{ '#00e5a0' if pd >= 0 else '#ff4070' }}">${{ "%.2f"|format(p.cur_price * p.size) }}</span>
+<span class="mono cur-pnl" style="color:{{ '#00e5a0' if p.pnl_pct >= 0 else '#ff4070' }}">{{ "%+.1f"|format(p.pnl_pct) }}%</span>
+<span class="mono cur-pnl-d" style="color:{{ '#00e5a0' if pd >= 0 else '#ff4070' }}">{{ '+' if pd >= 0 else '-' }}${{ "%.2f"|format(pd|abs) }}</span>
+<div class="q-cell">
+<input type="number" step="1" min="0" max="100" class="tp-input" id="tp-{{ loop.index0 }}" placeholder="18" value="{{ (p.current_tp*100)|round|int if p.current_tp else '' }}" />
+<span class="q-pct">%</span>
+<select id="conf-{{ loop.index0 }}" class="conf-sel" title="原始研究信心: 高=严格(必须新信息) / 中 / 低=允许Claude元认知下调5pp" onchange="saveConf('{{ p.asset }}', this.value)">
+<option value="" {% if not (p.meta and p.meta.original_confidence) %}selected{% endif %}>信心</option>
+<option value="high" {% if p.meta and p.meta.original_confidence == 'high' %}selected{% endif %}>高</option>
+<option value="medium" {% if p.meta and p.meta.original_confidence == 'medium' %}selected{% endif %}>中</option>
+<option value="low" {% if p.meta and p.meta.original_confidence == 'low' %}selected{% endif %}>低</option>
+</select>
+<select id="tier-{{ loop.index0 }}" class="conf-sel" title="止损分级 (Claude 入场分类决定): 收敛 从最高价回撤20%(≤3天12%)+确认 / 混合 从最高价回撤35%+确认 (v7.4.4, 跟收敛同形式) / 事件 入场-60%+$0.05地板 (必须选一档, 无未分类)" onchange="saveTier('{{ p.asset }}', this.value)">
+<option value="" disabled {% if not (p.meta and p.meta.stop_loss_tier) %}selected{% endif %}>⚠️选止损档</option>
+<option value="convergent"   {% if p.meta and p.meta.stop_loss_tier == 'convergent'   %}selected{% endif %}>收敛回撤20%</option>
+<option value="hybrid"       {% if p.meta and p.meta.stop_loss_tier == 'hybrid'       %}selected{% endif %}>混合回撤35%</option>
+<option value="event_driven" {% if p.meta and p.meta.stop_loss_tier == 'event_driven' %}selected{% endif %}>事件-60%+地板</option>
+</select>
+<button class="btn-small" onclick="saveTP('{{ p.asset }}','{{ p.market_slug }}','{{ p.side }}',{{ p.avg_price }},{{ loop.index0 }},'{{ p.end_date }}',{{ p.size }})">保存</button>
+</div>
+<span class="reeval-cell" data-asset="{{ p.asset }}">
+{% if p.should_reeval %}
+<button class="reeval-badge pending" onclick="toggleReevalMenu('{{ p.asset }}')">⚠️ 进度 {{ (p.progress_pct*100)|round|int }}% 重评 TP ▾</button>
+{% elif p.reeval_status == 'done_uplift' %}
+<span class="reeval-badge done">✓ 已重评 (上调至 {{ (p.reeval_new_tp*100)|round(1) }}%)</span>
+{% elif p.reeval_status == 'done_skip' %}
+<span class="reeval-badge done">已跳过重评</span>
+{% elif p.reeval_status == 'done_close' %}
+<span class="reeval-badge done">已重评清仓</span>
+{% endif %}
+</span>
+</div>
+{% if p.should_reeval %}
+<div class="reeval-menu" id="reeval-menu-{{ p.asset }}" style="display:none">
+<div class="reeval-menu-row">
+<button class="btn-small" onclick="copyReevalPrompt('{{ p.asset }}')">📋 复制 Claude Prompt</button>
+<span style="font-size:10px;color:var(--tx3);margin-left:8px">→ 粘贴到 Claude.ai Research</span>
+</div>
+<div class="reeval-menu-row">
+<span style="font-size:11px;font-weight:600">A. 上调 TP 到</span>
+<input type="number" step="1" min="0" max="99" class="tp-input" id="reeval-tp-{{ p.asset }}" placeholder="95" />
+<span style="font-size:10px;color:var(--tx3)">%</span>
+<button class="btn-small" onclick="markReeval('{{ p.asset }}','uplift')">✓ 应用</button>
+</div>
+<div class="reeval-menu-row">
+<button class="btn-small" onclick="markReeval('{{ p.asset }}','skip')">B. 跳过 (维持原TP)</button>
+<button class="btn-small btn-danger" onclick="markReeval('{{ p.asset }}','close')">C. 提前清仓</button>
+</div>
+</div>
+{% endif %}
+{% if p.meta and p.meta.monitor_state %}
+{% if p.meta and (p.meta.last_reeval_at or p.meta.created_at) or p.meta.entry_reason %}
+<div class="meta-info" style="font-size:10px;color:var(--tx3);margin:0 18px 4px 18px;display:flex;gap:14px;flex-wrap:wrap">
+{% if p.meta.last_reeval_at %}
+<span>📅 上次重评: {{ p.meta.last_reeval_at[:16].replace('T',' ') }}</span>
+{% elif p.meta.created_at %}
+<span>📅 入场: {{ p.meta.created_at[:16].replace('T',' ') }} (从未重评)</span>
+{% endif %}
+{% if p.meta.original_confidence %}<span>🎯 confidence: {{ p.meta.original_confidence }}</span>{% endif %}
+{% if p.meta.entry_reason %}<span style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ p.meta.entry_reason }}">💡 {{ p.meta.entry_reason[:60] }}{% if p.meta.entry_reason|length > 60 %}...{% endif %}</span>{% endif %}
+</div>
+{% endif %}
+<div class="monitor-state-row">
+<span class="ms-label">决策状态:</span>
+{% set st = p.meta.monitor_state %}
+{% if st == "AT_TARGET" %}
+<span class="ms-badge ms-AT_TARGET ms-clickable" onclick="executeState('{{ p.asset }}','AT_TARGET','{{ p.title|replace("'","&apos;")|truncate(50) }}', {{ p.size }}, {{ p.cur_price }})">AT_TARGET <span style="font-size:9px;opacity:0.7">点击执行</span></span>
+<button class="btn-small" onclick="toggleReeval('{{ p.asset }}')" style="margin-left:8px;font-size:10px;padding:4px 10px">🔄 重评</button>
+{% elif st == "PENDING_REEVAL" %}
+<span class="ms-badge ms-PENDING_REEVAL ms-clickable" onclick="toggleReeval('{{ p.asset }}')" title="已砸穿止损线 → 自动重评已触发, 暂不盲卖, 等重评结果 (离线自动执行 / 在线手动复评)">⏸ 等重评 · 暂不止损 <span style="font-size:9px;opacity:0.7">点击重评</span></span>
+{% elif st in ("HOLD", "MARGINAL", "SOFT_NEGATIVE") %}
+<span class="ms-badge ms-{{ st }} ms-clickable" onclick="toggleReeval('{{ p.asset }}')" style="position:relative">{{ st }} <span style="font-size:9px;opacity:0.7">点击重评</span>{% if p.needs_reeval %}<span class="reeval-dot" title="距上次重评 ≥24h"></span>{% endif %}</span>
+{% else %}
+<span class="ms-badge ms-{{ st }}">{{ st }}</span>
+{% endif %}
+<span class="ms-meta" style="font-size:10px;color:var(--tx3);margin-left:8px">
+{% if p.current_tp %}q={{ (p.current_tp*100)|round(1) }}% &nbsp;|&nbsp; p={{ (p.cur_price*100)|round(1) }}% &nbsp;|&nbsp; edge={{ ((p.current_tp - p.cur_price)*100)|round(1) }}pp{% endif %}
+{% if p.meta.executed_action %}&nbsp;|&nbsp; <span style="color:#888">已执行: {{ p.meta.executed_action }}</span>{% endif %}
+</span>
+<span style="margin-left:12px;display:flex;gap:6px;align-items:center">
+<input id="addusd-{{ p.asset }}" type="number" step="0.5" min="1" placeholder="$" style="width:56px;padding:4px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--tx);font-family:'JetBrains Mono';font-size:10px;height:24px" title="加仓美元金额">
+<button class="btn-small" onclick="addPosition('{{ p.asset }}','{{ p.side }}','{{ p.title|replace("'","&apos;")|truncate(50) }}')" style="font-size:10px;padding:4px 10px;background:rgba(0,229,160,0.12);color:var(--ac);border-color:rgba(0,229,160,0.4)">＋加仓</button>
+<button class="btn-small" onclick="forceLiquidate('{{ p.asset }}','{{ p.title|replace("'","&apos;")|truncate(50) }}',{{ p.size }},{{ p.cur_price }})" style="font-size:10px;padding:4px 10px;background:rgba(255,64,112,0.12);color:var(--rd);border-color:rgba(255,64,112,0.4)">✗清仓</button>
+<button class="btn-small" onclick="apiReeval('{{ p.asset }}','{{ p.title|replace("'","&apos;")|truncate(40) }}')" style="font-size:10px;padding:4px 10px;background:rgba(138,108,255,0.15);color:#a98cff;border-color:rgba(138,108,255,0.45)" title="用 Claude API 联网重评这个仓位 (替代手动复制粘贴; 你人在外面时一键跑。结果挂「自动重评建议」区等你手动确认, 不管在不在线都不自动卖)">🤖 API重评</button>
+{% if p.meta.disable_take_profit %}
+<button class="btn-small" id="tp-btn-{{ p.asset }}" onclick="toggleTakeProfit('{{ p.asset }}',0)" style="font-size:10px;padding:4px 10px;background:rgba(128,96,255,0.18);color:var(--vi);border-color:rgba(128,96,255,0.55)" title="此仓位已关止盈, 90¢/+100% 不会自动触发. 点击恢复.">🚫止盈OFF</button>
+{% else %}
+<button class="btn-small" id="tp-btn-{{ p.asset }}" onclick="toggleTakeProfit('{{ p.asset }}',1)" style="font-size:10px;padding:4px 10px;background:var(--sf);color:var(--tx3);border-color:var(--bd)" title="关闭自动止盈: 即使 best_bid≥90¢ 或浮盈+100% 也不卖. 止损/TIME_STOP/edge 仍生效.">🔔止盈ON</button>
+{% endif %}
+{% if p.meta and p.meta.autostop_disabled %}
+<button class="btn-small" id="sl-btn-{{ p.asset }}" onclick="toggleAutoStop('{{ p.asset }}',0)" style="font-size:10px;padding:4px 10px;background:rgba(255,64,112,0.18);color:var(--rd);border-color:rgba(255,64,112,0.55)" title="此仓自动止损已关 — %止损/亏损重评全失效, 只留 $0.05 地板兜底防归零. 点击恢复止损.">🛑止损OFF</button>
+{% else %}
+<button class="btn-small" id="sl-btn-{{ p.asset }}" onclick="toggleAutoStop('{{ p.asset }}',1)" style="font-size:10px;padding:4px 10px;background:var(--sf);color:var(--tx3);border-color:var(--bd)" title="关闭此仓全部自动止损 (%止损 + 亏损自动重评 全失效, 只留 $0.05 地板兜底). TIME_STOP/止盈 不受影响.">🛡止损ON</button>
+{% endif %}
+</span>
+</div>
+{% if st in ("HOLD", "MARGINAL", "SOFT_NEGATIVE", "AT_TARGET", "PENDING_REEVAL") %}
+<div class="reeval-panel" id="rv-{{ p.asset }}" style="display:none">
+<div class="rv-grid">
+<div class="rv-step">
+<div class="rv-step-title">1. 复制 Claude 重评 prompt</div>
+<button class="btn-small" onclick="copyReevalPrompt('{{ p.asset }}')">📋 复制 prompt</button>
+<div class="rv-hint">粘贴到 Claude.ai Research 模式, 等 5-10 分钟</div>
+</div>
+<div class="rv-step">
+<div class="rv-step-title">2. 选 hold/update_q/exit</div>
+<div class="rv-actions">
+<button class="btn-small" onclick="markReevalHold('{{ p.asset }}')">维持 q (hold)</button>
+<input type="number" id="newq-{{ p.asset }}" placeholder="新 q %" step="0.1" min="1" max="99" class="newq-inp">
+<button class="btn-small btn-warn" onclick="submitNewQ('{{ p.asset }}')">更新 q</button>
+<button class="btn-small btn-danger" onclick="reevalExit('{{ p.asset }}','{{ p.title|replace("'","&apos;")|truncate(50) }}', {{ p.size }}, {{ p.cur_price }})">建议清仓 (exit)</button>
+</div>
+</div>
+<div class="rv-step">
+<div class="rv-step-title">3. 或: 粘 Claude 重评 JSON 一键应用 (#5)</div>
+<textarea id="rvjson-{{ p.asset }}" placeholder='粘 Claude 重评输出里的 {&quot;action&quot;:&quot;...&quot;,&quot;new_q&quot;:...} 块' style="width:100%;height:44px;font-size:10px;font-family:monospace;background:var(--bg);border:1px solid var(--bd);border-radius:6px;color:var(--tx);padding:6px;box-sizing:border-box"></textarea>
+<button class="btn-small btn-warn" onclick="applyReevalJson('{{ p.asset }}','{{ p.title|replace("'","&apos;")|truncate(50) }}',{{ p.size }},{{ p.cur_price }})" style="margin-top:5px">🔎 解析并应用</button>
+<div class="rv-hint">按 JSON 的 action 走: update_q→改q · hold→维持 · exit→弹清仓确认 · cancel_autostop→关止损</div>
+</div>
+</div>
+</div>
+{% endif %}
+{% else %}
+<div class="triggers-empty">👉 填入 q (Claude 校准估算) 后显示决策状态</div>
+{% endif %}
+{% endfor %}
+{% if not positions %}<div class="emp">暂无持仓</div>{% endif %}
+</div></div>
+<div class="sl" id="sec-events">🎯 事件中心</div>
+<div class="card" style="padding:18px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap">
+<div style="display:flex;gap:4px">
+<button class="range-btn active" data-mtab="realtime" onclick="switchMoverTab('realtime')">实时榜</button>
+<button class="range-btn" data-mtab="movers" onclick="switchMoverTab('movers')">涨跌榜</button>
+<button class="range-btn" data-mtab="value" onclick="switchMoverTab('value')">现值榜</button>
+</div>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<div id="realtime-range-group" style="display:flex;gap:4px">
+<button class="range-btn" data-rtrange="30m" onclick="loadRealtime('30m')">30m</button>
+<button class="range-btn active" data-rtrange="1h" onclick="loadRealtime('1h')">1h</button>
+<button class="range-btn" data-rtrange="6h" onclick="loadRealtime('6h')">6h</button>
+<button class="range-btn" data-rtrange="1d" onclick="loadRealtime('1d')">1d</button>
+</div>
+<div id="movers-range-group" style="display:none;gap:4px">
+<button class="range-btn active" data-mrange="1d" onclick="loadMovers('1d')">1D</button>
+<button class="range-btn" data-mrange="1w" onclick="loadMovers('1w')">1W</button>
+</div>
+<div id="metric-toggle-group" style="display:flex;gap:4px">
+<button class="range-btn active" data-metric="pp" onclick="setMetricMode('pp')" title="按百分点排序">pp</button>
+<button class="range-btn" data-metric="dollar" onclick="setMetricMode('dollar')" title="按美元盈亏排序">$</button>
+</div>
+<button class="range-btn" onclick="refreshMoverTab()" title="刷新最新数据 (绕过缓存)">↻</button>
+<button class="range-btn" id="mover-more-btn" onclick="toggleMoverExpanded()">More</button>
+</div>
+</div>
+<div id="realtime-section">
+<div style="font-size:11px;color:#ffc040;font-weight:700;letter-spacing:0.5px;margin-bottom:6px">⚡ 异动 <span id="realtime-suffix">Top 3</span></div>
+<div id="realtime-list" style="max-height:400px;overflow-y:auto"><div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div></div>
+</div>
+<div id="movers-section" style="display:none">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
+<div>
+<div style="font-size:11px;color:#00e5a0;font-weight:700;letter-spacing:0.5px;margin-bottom:6px">📈 涨幅 <span id="movers-g-suffix">Top 3</span></div>
+<div id="movers-gainers" style="max-height:400px;overflow-y:auto"><div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div></div>
+</div>
+<div>
+<div style="font-size:11px;color:#ff4070;font-weight:700;letter-spacing:0.5px;margin-bottom:6px">📉 跌幅 <span id="movers-l-suffix">Top 3</span></div>
+<div id="movers-losers" style="max-height:400px;overflow-y:auto"><div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div></div>
+</div>
+</div>
+</div>
+<div id="value-section" style="display:none">
+<div style="font-size:11px;color:#00c8ff;font-weight:700;letter-spacing:0.5px;margin-bottom:6px">💼 持仓现值 <span id="value-suffix">Top 3</span></div>
+<div id="value-list" style="max-height:400px;overflow-y:auto"><div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div></div>
+</div>
+</div>
+<div class="sl">📝 操作记录</div>
+<div class="card events-big" id="events-card"><div class="chd"><h2>卖出事件</h2><div class="events-toolbar"><span class="cnt" id="ev-cnt">{{ events|selectattr('event_type','in',['auto_sell','user_sell'])|list|length }}</span><button class="btn-small" id="ev-more-btn" onclick="toggleAllEvents()">更多</button></div></div><div class="cb" style="max-height:540px">
+{% for e in events %}
+{% set d = e.detail or '' %}
+{% set is_tp_sell = e.event_type == 'auto_sell' and ('TAKE_PROFIT_PRICE' in d or 'TAKE_PROFIT_PNL' in d or 'AT_TARGET' in d) %}
+<div class="lr ev-row ev-{{ e.event_type }}">
+  <div class="lt">{{ e.timestamp[5:19].replace('T',' ') }}</div>
+  <div><span class="tag tag-{{ e.event_type }}{% if is_tp_sell %} is-tp{% endif %}">{{ e.event_type }}</span></div>
+  <div class="ldd">
+    <div class="ev-title">{{ e.market_slug or '(无标题)' }}</div>
+    {% if e.event_type in ('auto_sell','user_sell') %}
+      {# 卖出事件: 压紧到一行 (state · size · detail), 跟在 title 下面 #}
+      {% set state_badge = '' %}
+      {% if 'TAKE_PROFIT_PRICE' in d %}{% set state_badge = '<span class="ev-state tp-price">📈 价格止盈</span>' %}
+      {% elif 'TAKE_PROFIT_PNL' in d %}{% set state_badge = '<span class="ev-state tp-pnl">📈 浮盈翻倍</span>' %}
+      {% elif 'STOP_LOSS' in d %}{% set state_badge = '<span class="ev-state sl">📉 止损</span>' %}
+      {% elif 'TIME_STOP' in d %}{% set state_badge = '<span class="ev-state ts">⏰ 临结算锁定</span>' %}
+      {% elif 'FORCE_EXIT' in d or 'force_exit' in d %}{% set state_badge = '<span class="ev-state force-exit">✗ 手动清仓</span>' %}
+      {% elif 'AT_TARGET' in d %}{% set state_badge = '<span class="ev-state at-target">🎯 到目标</span>' %}
+      {% endif %}
+      {% set size_part = d.split('size=')[1].split(' ')[0] if 'size=' in d else '' %}
+      <div class="ev-inline">
+        {% if state_badge %}{{ state_badge|safe }}{% endif %}
+        {% if size_part %}<span class="ev-num">{{ size_part }} 股</span><span class="sep">·</span>{% endif %}
+        <span class="ev-detail-mini">{{ d }}</span>
+      </div>
+    {% else %}
+      <div class="ev-detail">{{ d }}</div>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+{% if not events %}<div class="emp">暂无</div>{% endif %}
+</div></div>
+
+<details class="fold" id="sec-rules">
+<summary>📏 自动规则 — 止盈 / 止损 / TIME_STOP 触发条件 (参考信息, 默认收起)</summary>
+<div class="rules">
+<div class="rule"><span class="k">止盈 (自动, v7.0 分档)</span><span class="v" style="color:#008055;font-weight:600">事件型 best_bid≥92¢ 卖一半留一半 / 收敛型≤3天 ≥88¢ 全卖 / 其余 ≥{{ take_profit_price_cent }}¢ 全卖 (最高优先级)</span></div>
+<div class="rule"><span class="k">TAKE_PROFIT_PNL (自动)</span><span class="v" style="color:#008055;font-weight:600">(best_bid - avg)/avg ≥ +{{ take_profit_pnl_pct }}% (翻倍) → 全卖锁本</span></div>
+<div class="rule"><span class="k">STOP_LOSS (LLM 入场分级, v7.0)</span><span class="v red">收敛型 从最高价回撤 -{{ sl_convergent }}%(≤3天 -12%)+连6拍确认 / 混合型 入场锚 -{{ sl_hybrid }}% / 事件驱动型 不止损 (价&lt;{{ sl_floor_cent }}¢ 地板兜底) / 未分类老仓位 入场锚 -{{ sl_legacy }}% · 砸穿→PENDING_REEVAL 交重评</span></div>
+<div class="rule"><span class="k">TIME_STOP (自动)</span><span class="v red">距结算 ≤{{ time_stop_days }}天 且 漂移 &lt;{{ time_stop_drift_pp }}pp → 自动整笔卖</span></div>
+<div class="rule"><span class="k">HOLD</span><span class="v" style="color:#888">edge > +{{ hold_min_edge_pp }}pp 持有不动</span></div>
+<div class="rule"><span class="k">MARGINAL</span><span class="v" style="color:#cc9900">-{{ soft_neg_pp_abs }} ≤ edge ≤ +{{ hold_min_edge_pp }}pp 边缘地带</span></div>
+<div class="rule"><span class="k">SOFT_NEGATIVE</span><span class="v" style="color:#3a8a5a">edge &lt; -{{ soft_neg_pp_abs }}pp (重评过) 已知, 自己决定</span></div>
+<div class="rule"><span class="k">AT_TARGET</span><span class="v" style="color:#00a884">p ≥ q 达目标 建议清仓</span></div>
+<div class="rule"><span class="k">检查频率</span><span class="v">每30秒</span></div>
+<div class="rule"><span class="k">触发用价</span><span class="v" style="color:var(--tx2);font-size:10px">止盈用 best_bid (防虚高假触发) / 止损用 cur (防虚低早卖)</span></div>
+</div></details>
+<div class="sl" id="sec-log">🖥 实时日志</div>
+<div class="ll"><div class="chd"><h2>Monitor Log</h2><div style="display:flex;gap:8px"><div class="lp" style="font-size:9px"><div class="ld"></div>3s</div><button class="btn" onclick="document.getElementById('lb').scrollTop=999999" style="font-size:10px;padding:4px 10px">↓</button></div></div><div class="lc" id="lb">Loading...</div></div>
+</div>
+<footer>Polymarket v7.1 · 🦖</footer>
+<textarea id="pt" style="position:absolute;left:-9999px">{{ prompt }}</textarea>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<script>
+// 整页刷新已禁用 - 改用局部刷新
+function syncSnapshot(){fetch('/api/snapshot').then(r=>r.json()).then(d=>{if(!d.ok)return;updateMetrics(d);updatePositions(d.positions||[])}).catch(e=>{})}
+function updateMetrics(d){const el=(id)=>document.getElementById(id);if(el('m-pnl')){el('m-pnl').textContent='$'+d.total_pnl.toFixed(2);el('m-pnl').style.color=d.total_pnl>=0?'#00e5a0':'#ff4070'}if(el('m-count')){if(parseInt(el('m-count').textContent)!==d.position_count){location.reload();return}}if(el('m-cost'))el('m-cost').textContent='$'+d.total_cost.toFixed(2);if(el('m-revenue')&&d.total_value!=null)el('m-revenue').textContent='$'+d.total_value.toFixed(2);if(el('m-portfolio')&&d.assets_total!=null)el('m-portfolio').textContent='$'+d.assets_total.toFixed(2);if(el('m-cash')&&d.cash!=null)el('m-cash').textContent='$'+d.cash.toFixed(2)}
+function updatePositions(rows){rows.forEach(p=>{const row=document.querySelector(`[data-asset='${p.asset}']`);if(!row)return;const cp=row.querySelector('.cur-price');if(cp)cp.textContent='$'+p.cur_price.toFixed(3);const cv=row.querySelector('.cur-value');if(cv){cv.textContent='$'+p.value.toFixed(2);if(p.pnl_dollar!=null)cv.style.color=p.pnl_dollar>=0?'#00e5a0':'#ff4070'}const pn=row.querySelector('.cur-pnl');if(pn){pn.textContent=(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(1)+'%';pn.style.color=p.pnl_pct>=0?'#00e5a0':'#ff4070'}const pd=row.querySelector('.cur-pnl-d');if(pd&&p.pnl_dollar!=null){pd.textContent=(p.pnl_dollar>=0?'+$':'-$')+Math.abs(p.pnl_dollar).toFixed(2);pd.style.color=p.pnl_dollar>=0?'#00e5a0':'#ff4070'}});const rb=document.getElementById('rb');if(rb)rb.textContent='\u{2713} '+new Date().toLocaleTimeString().slice(0,5)}
+syncSnapshot();setInterval(syncSnapshot,30000);
+function fl(){fetch('/api/logs').then(r=>r.json()).then(d=>{if(!d.ok)return;const b=document.getElementById('lb');const a=b.scrollHeight-b.scrollTop-b.clientHeight<40;b.innerHTML=d.lines.map(l=>{let c='';if(l.includes('[INFO]'))c='INFO';else if(l.includes('[WARNING]'))c='WARNING';else if(l.includes('[ERROR]'))c='ERROR';return'<div class="ll2"><span class="ts">'+l.substring(0,19)+'</span> <span class="'+c+'">['+c+']</span> <span class="msg">'+l.substring(20).replace(/\[(?:INFO|WARNING|ERROR)\]\s?/,'')+'</span></div>'}).join('');if(a)b.scrollTop=b.scrollHeight})}
+fl();setInterval(fl,12000);
+function doAction(a){showT('ok',a==='check'?'检查中...':'...');fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})}).then(r=>r.json()).then(d=>{showT(d.ok?'ok':'err',d.message);if(a==='refresh')setTimeout(syncSnapshot,800)}).catch(()=>showT('err','错误'))}
+function showT(t,m){const e=document.getElementById('toast');e.className='toast '+t+' show';e.textContent=m;setTimeout(()=>e.classList.remove('show'),3000)}
+
+// v5.10: closed-positions JS 已迁移到 /history 页面.
+
+function toggleAllEvents(){
+  const card=document.getElementById('events-card');
+  const btn=document.getElementById('ev-more-btn');
+  const cnt=document.getElementById('ev-cnt');
+  if(!card)return;
+  card.classList.toggle('show-all');
+  const showAll=card.classList.contains('show-all');
+  if(btn)btn.textContent=showAll?'收起':'更多';
+  if(cnt){
+    const all=card.querySelectorAll('.ev-row').length;
+    const sells=card.querySelectorAll('.ev-row.ev-auto_sell, .ev-row.ev-user_sell').length;
+    cnt.textContent=showAll?(all+' 全部'):(sells+' 卖出');
+  }
+}
+async function toggleReeval(tokenId){
+  const el = document.getElementById('rv-' + tokenId);
+  if(!el) return;
+  el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+}
+
+function apiReeval(tokenId, title){
+  if(!confirm('用 Claude API 联网重评「'+title+'」?\n会花一次 API 钱。\n结果出来后挂在「自动重评建议」区, 等你点「✅ 确认执行」才动作 —\n不管你在不在线, 都不会自动卖。'))return;
+  showT('ok','🤖 API 重评已触发, 0.5-2 分钟后在「自动重评建议」区出结果…');
+  fetch('/api/auto_reeval/trigger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token_id:tokenId})}).then(r=>r.json()).then(d=>{showT(d.ok?'ok':'err',d.message||'');if(typeof arLoad==='function')arLoad();}).catch(()=>showT('err','触发失败'));
+}
+function copyReevalPrompt(tokenId){
+  fetch('/api/reeval_prompt?token_id=' + tokenId)
+    .then(r=>r.json()).then(d=>{
+      if(!d.ok){ showT('err', d.message||'生成失败'); return; }
+      navigator.clipboard.writeText(d.prompt).then(()=>{
+        showT('ok', '已复制 prompt (' + d.prompt.length + ' 字符), 粘贴到 Claude.ai Research 模式');
+      }).catch(()=>showT('err','复制失败, 浏览器需 https 或 localhost'));
+    }).catch(()=>showT('err','网络失败'));
+}
+
+// v5.8 + v5.9: 持仓 tab 切换 (3 个 panel: current / reeval / cluster)
+function switchPosTab(name){
+  document.querySelectorAll('.pos-tab').forEach(b=>b.classList.remove('pos-tab-active'));
+  const tab=document.getElementById('ptab-'+name);
+  if(tab)tab.classList.add('pos-tab-active');
+  const panels=['current','ops','reeval','cluster'];
+  panels.forEach(pn=>{
+    const el=document.getElementById('pos-panel-'+pn);
+    if(el)el.style.display=(pn===name)?'':'none';
+  });
+  if(name==='cluster')loadClusterSummary();
+}
+// v7.x (#5): 粘 Claude 重评 JSON → 按 action 一键应用 (复用现有 handler; exit 走确认弹窗防误卖)
+function applyReevalJson(asset, title, size, cur){
+  const ta=document.getElementById('rvjson-'+asset);
+  if(!ta) return;
+  const txt=(ta.value||'').trim();
+  if(!txt){ showT('err','先粘贴 Claude 重评的 JSON'); return; }
+  let obj=null;
+  try{ const m=txt.match(/\{[\s\S]*\}/); obj=JSON.parse(m?m[0]:txt); }
+  catch(e){ showT('err','JSON 解析失败, 检查格式 (要含 {"action":...})'); return; }
+  const action=String(obj.action||'').trim();
+  let nq=obj.new_q;
+  if(nq!=null){ nq=parseFloat(nq); if(nq>1)nq=nq/100; }
+  if(action==='update_q'){
+    if(nq==null||isNaN(nq)){ showT('err','action=update_q 但 JSON 里没有有效 new_q'); return; }
+    const inp=document.getElementById('newq-'+asset); if(inp) inp.value=(nq*100).toFixed(1);
+    submitNewQ(asset);
+  }else if(action==='hold'){
+    markReevalHold(asset);
+  }else if(action==='exit'){
+    reevalExit(asset, title, size, cur);   // 有确认弹窗, 不直接卖
+  }else if(action==='cancel_autostop'){
+    toggleAutoStop(asset, 1);
+  }else{
+    showT('err','无法识别 action: '+(action||'(空)'));
+  }
+}
+
+// v5.9: Cluster 分析 tab 渲染顶部汇总
+async function loadClusterSummary(){
+  try{
+    const r=await fetch('/api/list_clusters');
+    const d=await r.json();
+    if(!d.ok){return}
+    const el=document.getElementById('cluster-summary');
+    if(!el)return;
+    if(!d.clusters||d.clusters.length===0){el.textContent='(暂无 cluster 分组, 用 Claude 分析后填入)';return}
+    el.innerHTML='cluster 暴露: '+d.clusters.map(c=>
+      `<span style="margin-right:14px"><b style="color:var(--ac)">${c.cluster_id}</b> $${c.exposure_usd.toFixed(2)} (${c.count} 仓)</span>`
+    ).join('');
+  }catch(e){}
+}
+
+// v5.9: 一键复制 cluster 分析 prompt 给 Claude
+function copyClusterAnalysisPrompt(){
+  const rows=document.querySelectorAll('.cluster-row');
+  if(rows.length===0){showT('err','暂无持仓');return}
+  const lines=[];
+  lines.push('# Polymarket 仓位相关性分析 (cluster 分析)');
+  lines.push('');
+  lines.push('请用 polymarket-cluster-analyzer skill 给我下方仓位分配 cluster_id.');
+  lines.push('');
+  lines.push('Cluster 不是按话题分, 是按相关性分:');
+  lines.push('"如果此仓位赢了, 其他哪些会一起赢? 一起赢 → 同 cluster"');
+  lines.push('');
+  lines.push('命名约定 kebab-case: <topic>-<direction>, 例 iran-deescalation-no');
+  lines.push('');
+  lines.push('## 当前持仓快照');
+  lines.push('');
+  lines.push('| slug | side | avg | cur | q | tier | 当前 cluster_id |');
+  lines.push('|---|---|---|---|---|---|---|');
+  rows.forEach(row=>{
+    const asset=row.getAttribute('data-asset');
+    const title=row.querySelector('.rv-title').textContent.trim().split(/\s+/).slice(0,12).join(' ');
+    const meta=row.querySelector('.rv-meta').textContent.trim();
+    const cur_cluster=row.querySelector('.cluster-input').value||'(NULL)';
+    lines.push(`| ${title} | (见下) | ${meta} | ${cur_cluster} |`);
+  });
+  lines.push('');
+  lines.push('## 输出要求');
+  lines.push('');
+  lines.push('末尾必须有 ``` 包围的 "Cluster 分配" 表, 每个仓位一行:');
+  lines.push('');
+  lines.push('| slug (开头 30 字符即可) | cluster_id | 一句话相关性理由 |');
+  lines.push('|---|---|---|');
+  const text=lines.join('\n');
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(text).then(()=>showT('ok','已复制 ('+text.length+' 字符) 粘到 Claude.ai')).catch(()=>showT('err','复制失败'));
+  }else{
+    const a=document.createElement('textarea');a.value=text;a.style.position='fixed';a.style.left='-9999px';
+    document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a);
+    showT('ok','已复制');
+  }
+}
+
+// ============ v5.11: Claude JSON 快速通道 ============
+// 从粘贴文本里鲁棒提取 JSON: 直接 parse → ```json fence → 首个 [ 到末个 ] / { 到 }
+function cjExtract(text){
+  text = (text||'').trim();
+  if(!text) return null;
+  try{ return JSON.parse(text); }catch(_){}
+  const fence = text.match(/```json\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/);
+  if(fence){ try{ return JSON.parse(fence[1].trim()); }catch(_){} }
+  for(const [a,b] of [['[',']'],['{','}']]){
+    const i = text.indexOf(a), j = text.lastIndexOf(b);
+    if(i >= 0 && j > i){ try{ return JSON.parse(text.slice(i, j+1)); }catch(_){} }
+  }
+  return null;
+}
+// v5.12: cjRecs + 草稿持久化 (localStorage, 刷新不丢, 直到点击清理或录入成功)
+let cjRecs = [];
+const CJ_LS_RECS = 'pm_cj_recs_v1';   // 解析出的推荐数组
+const CJ_LS_RAW  = 'pm_cj_raw_v1';    // 原始粘贴文本
+const CJ_LS_CALC = 'pm_cj_calc_v1';   // 计算器输入 + 推荐金额结果 HTML
+function cjRenderRecs(){
+  const box = document.getElementById('cj-recs');
+  if(!box) return;
+  box.innerHTML = cjRecs.map((r, i) => {
+    const side = (r.side||'?').toUpperCase();
+    const sideColor = side === 'YES' ? '#00a884' : '#cc3050';
+    const qs = r.q != null ? (r.q*100).toFixed(0)+'%' : '?';
+    const ps = r.cur_price != null ? (r.cur_price*100).toFixed(0)+'%' : '?';
+    return `<div class="cj-rec">
+      <span class="cj-slug" title="${r.slug||''}">${r.slug||'(无 slug)'}</span>
+      <span style="color:${sideColor};font-weight:700">${side}</span>
+      <span class="cj-kv">q ${qs} · p ${ps} · ${r.stop_loss_tier||'?'} · ${r.confidence||'?'}${r.cluster_id ? ' · '+r.cluster_id : ''}</span>
+      <span style="margin-left:auto;display:flex;gap:6px">
+        <button class="btn-small" onclick="cjApplyCalc(${i})">💵 填入计算器</button>
+        <button class="btn-small" onclick="cjApplyPaper(${i})" title="不真下单 → 按公式自动算金额, 直接加入测试仓(实时盯盘验证 Claude 这条准不准), 不用去 /paper 单独录">🧪 加入测试仓</button>
+        <button class="btn-small" onclick="cjApplyPos(${i})" title="买完、仓位出现在下方持仓表后, 点这个一键把 q/信心/止损/cluster/tag 全部录入">📌 录入持仓</button>
+      </span>
+    </div>`;
+  }).join('');
+}
+function cjPersist(){
+  try{
+    if(cjRecs.length) localStorage.setItem(CJ_LS_RECS, JSON.stringify(cjRecs));
+    else localStorage.removeItem(CJ_LS_RECS);
+    const raw = (document.getElementById('cj-paste')||{}).value || '';
+    if(raw.trim()) localStorage.setItem(CJ_LS_RAW, raw); else localStorage.removeItem(CJ_LS_RAW);
+  }catch(_){}
+}
+function cjParse(){
+  const raw = document.getElementById('cj-paste').value;
+  let parsed = cjExtract(raw);
+  if(parsed == null){ showT('err','解析失败: 没找到合法 JSON, 检查是否完整复制了 json 块'); return; }
+  if(!Array.isArray(parsed)) parsed = [parsed];
+  parsed = parsed.filter(r => r && typeof r === 'object' && (r.slug || r.q != null));
+  if(!parsed.length){ showT('err','JSON 里没有可用的推荐对象'); return; }
+  cjRecs = parsed;
+  cjRenderRecs();
+  cjPersist();
+  showT('ok','解析到 ' + parsed.length + ' 个推荐 (已存草稿, 刷新不丢)');
+  if(parsed.length === 1) cjApplyCalc(0);
+}
+function cjDays(r){
+  if(r.days_to_resolution != null && !isNaN(parseInt(r.days_to_resolution))) return parseInt(r.days_to_resolution);
+  if(r.end_date){
+    const d = Math.ceil((new Date(r.end_date) - Date.now()) / 86400000);
+    if(!isNaN(d) && d > 0) return d;
+  }
+  return null;
+}
+function cjApplyCalc(i){
+  const r = cjRecs[i]; if(!r) return;
+  const set = (id, v) => { if(v != null && v !== '') document.getElementById(id).value = v; };
+  set('sg-q', r.q != null ? (r.q*100).toFixed(1) : null);
+  set('sg-p', r.cur_price != null ? (r.cur_price*100).toFixed(1) : null);
+  if(r.confidence) document.getElementById('sg-conf').value = String(r.confidence).toLowerCase();
+  if(r.stop_loss_tier) document.getElementById('sg-tier').value = r.stop_loss_tier;
+  set('sg-days', cjDays(r));
+  set('sg-cluster', r.cluster_id || '');
+  calcSize();
+  document.getElementById('sec-size').scrollIntoView();
+}
+function cjApplyPos(i){
+  const r = cjRecs[i]; if(!r) return;
+  // 按 slug 在持仓表里找行 (买完后 polymarket 同步给 /api/snapshot → 页面 reload 出现)
+  const rows = document.querySelectorAll('.pos-row[data-slug]');
+  let row = null;
+  for(const el of rows){ if(el.getAttribute('data-slug') === r.slug){ row = el; break; } }
+  if(!row){ showT('err','持仓里没找到 ' + (r.slug||'?') + ' — 先去 Polymarket 下单, 等仓位出现在持仓表后再点'); return; }
+  const rowSide = (row.getAttribute('data-side')||'').toUpperCase();
+  if(r.side && rowSide && r.side.toUpperCase() !== rowSide){
+    if(!confirm('⚠️ 方向不一致: JSON 是 ' + r.side + ', 实际持仓是 ' + rowSide + '. 仍然录入?')) return;
+  }
+  const payload = {
+    token_id: row.getAttribute('data-asset'),
+    slug: r.slug,
+    side: rowSide || (r.side||'').toUpperCase(),
+    entry_price: parseFloat(row.getAttribute('data-avg')) || 0,
+    tp: r.q,
+    end_date: r.end_date || row.getAttribute('data-end') || '',
+    size: parseFloat(row.getAttribute('data-size')) || 0,
+    original_confidence: r.confidence ? String(r.confidence).toLowerCase() : '',
+    stop_loss_tier: r.stop_loss_tier || '',
+    cluster_id: r.cluster_id || '',
+    tag: r.tag || '',
+    entry_reason: r.reason || ''
+  };
+  fetch('/api/record_position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(resp=>resp.json()).then(d=>{
+      if(!d.ok){ showT('err', d.message||'录入失败'); return; }
+      showT('ok','✓ 已录入: q/信心/止损/cluster/tag 全套');
+      // 同步行内控件显示, 不刷新页面
+      const idx = row.getAttribute('data-idx');
+      const tpEl = document.getElementById('tp-'+idx); if(tpEl && r.q != null) tpEl.value = Math.round(r.q*100);
+      const cEl = document.getElementById('conf-'+idx); if(cEl && r.confidence) cEl.value = String(r.confidence).toLowerCase();
+      const tEl = document.getElementById('tier-'+idx); if(tEl && r.stop_loss_tier) tEl.value = r.stop_loss_tier;
+      const clEl = document.querySelector('.cluster-input[data-asset="'+payload.token_id+'"]'); if(clEl && r.cluster_id) clEl.value = r.cluster_id;
+      // v5.12: 录入成功 → 从快速通道移除该条 + 更新草稿 (空了草稿自动清掉)
+      cjRecs.splice(i, 1);
+      cjRenderRecs();
+      cjPersist();
+    }).catch(()=>showT('err','录入失败 (网络)'));
+}
+// v7.1.1: 一键把这条推荐加入测试仓 (不真下单, 金额按主页同一套公式自动算, 不用去 /paper 单独录)。
+// 保留该条不删 (测试归测试, 之后真买了还能点「录入持仓」)。
+function cjApplyPaper(i){
+  const r = cjRecs[i]; if(!r) return;
+  if(!r.slug || !r.side){ showT('err','这条缺 slug/side, 没法加测试仓'); return; }
+  if(r.cur_price == null){ showT('err','这条缺 cur_price(入场价), 没法加测试仓'); return; }
+  showT('ok','加入测试仓中 (按公式算金额)…');
+  fetch('/api/paper/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    slug:r.slug, side:r.side, entry_price:r.cur_price, auto_size:true,
+    q:r.q, confidence:r.confidence, stop_loss_tier:r.stop_loss_tier,
+    cluster_id:r.cluster_id, tag:r.tag, end_date:r.end_date, days_to_resolution:r.days_to_resolution, notes:r.reason
+  })}).then(resp=>resp.json()).then(d=>{
+    if(!d.ok){ showT('err', d.message||'加入测试仓失败'); return; }
+    showT('ok','🧪 已加入测试仓: '+(d.title||r.slug)+' · 金额 $'+(d.size_usd!=null?d.size_usd:'?')+' (公式自动). 顶部「🧪 测试仓」看盯盘');
+  }).catch(()=>showT('err','加入测试仓失败 (网络)'));
+}
+
+// v5.12: 推荐金额 (计算器结果) 持久化 + 草稿恢复 + 清理 (刷新不丢, 直到清理或录入成功)
+function cjPersistCalc(){
+  try{
+    const v = id => (document.getElementById(id)||{}).value || '';
+    const res = document.getElementById('sg-result');
+    localStorage.setItem(CJ_LS_CALC, JSON.stringify({
+      q:v('sg-q'), p:v('sg-p'), conf:v('sg-conf'), tier:v('sg-tier'),
+      days:v('sg-days'), cluster:v('sg-cluster'), html: res ? res.innerHTML : ''
+    }));
+  }catch(_){}
+}
+function cjRestore(){
+  try{
+    const raw = localStorage.getItem(CJ_LS_RAW);
+    if(raw){ const ta = document.getElementById('cj-paste'); if(ta) ta.value = raw; }
+    const recs = localStorage.getItem(CJ_LS_RECS);
+    if(recs){ const arr = JSON.parse(recs); if(Array.isArray(arr) && arr.length){ cjRecs = arr; cjRenderRecs(); } }
+    const calc = localStorage.getItem(CJ_LS_CALC);
+    if(calc){
+      const c = JSON.parse(calc);
+      const setv = (id,val) => { const el=document.getElementById(id); if(el && val!=null && val!=='') el.value=val; };
+      setv('sg-q',c.q); setv('sg-p',c.p); setv('sg-conf',c.conf); setv('sg-tier',c.tier);
+      setv('sg-days',c.days); setv('sg-cluster',c.cluster);
+      if(c.html){ const r=document.getElementById('sg-result'); if(r) r.innerHTML=c.html; }
+    }
+  }catch(_){}
+}
+function cjClear(){
+  cjRecs = [];
+  const ta=document.getElementById('cj-paste'); if(ta) ta.value='';
+  cjRenderRecs();
+  ['sg-q','sg-p','sg-days','sg-cluster'].forEach(id=>{const el=document.getElementById(id); if(el) el.value='';});
+  const cf=document.getElementById('sg-conf'); if(cf) cf.value='medium';
+  const tr=document.getElementById('sg-tier'); if(tr) tr.value='hybrid';
+  const res=document.getElementById('sg-result');
+  if(res) res.innerHTML='输入参数后点 "算" 看推荐. 已上仓: <span id="sg-context-bankroll">—</span> · DD 余预算: <span id="sg-context-dd">—</span>';
+  try{ localStorage.removeItem(CJ_LS_RECS); localStorage.removeItem(CJ_LS_RAW); localStorage.removeItem(CJ_LS_CALC); }catch(_){}
+  showT('ok','已清理快速通道 + 推荐金额');
+}
+window.addEventListener('load', cjRestore);
+
+// ============ v5.13: 自动重评建议 (大跌联网调研 → 等确认; 闩锁=每仓只跑一次, 清空才再触发) ============
+function arEsc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function arTime(iso){ if(!iso) return ''; try{ return new Date(iso).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch(e){ return ''; } }
+function arProv(p){ return p==='glm'?'<span style="color:#8a6cff;font-weight:600">智谱GLM</span>':p==='claude'?'<span style="color:#00c8ff;font-weight:600">Claude</span>':''; }
+function arCard(inner, color){ return '<div style="background:var(--bg);border:1px solid var(--bd);border-left:3px solid '+color+';border-radius:8px;padding:11px 13px">'+inner+'</div>'; }
+function arResetBtn(id){ return '<button class="btn-small" onclick="arClear('+id+')" title="把这条从清单移除. 是否再自动评由 6h 冷却 + 又多亏5pp 自动控制, 跟清不清空无关.">🗑 清空</button>'; }
+let arOpen = new Set();  // v6.0.2: 记住哪些卡片展开了, 轮询重渲染不收回 (点开就留着, 再点才收)
+function arToggle(id){ if(arOpen.has(id)) arOpen.delete(id); else arOpen.add(id); var op=arOpen.has(id); var e=document.getElementById('ar-det-'+id); if(e) e.style.display=op?'block':'none'; var b=document.getElementById('ar-more-'+id); if(b) b.textContent=op?'收起 ▴':'更多 ▾'; }
+let arSeenUrgent = null;
+async function arLoad(){
+  try{
+    const d = await (await fetch('/api/auto_reeval/pending')).json();
+    if(!d.ok) return;
+    const list=document.getElementById('ar-list'), empty=document.getElementById('ar-empty'), head=document.getElementById('ar-head');
+    // 先清掉所有持仓行名称后的灯
+    document.querySelectorAll('.ar-light').forEach(function(el){ el.className='ar-light'; el.title=''; });
+    if(!list) return;
+    const rows = d.rows || [];
+    if(head) head.style.display = rows.length ? 'flex' : 'none';
+    if(!rows.length){ list.innerHTML=''; if(empty) empty.style.display=''; return; }
+    if(empty) empty.style.display='none';
+    // v5.15 紧急弹窗: 出现新的 pending/manual → 主页红闪弹窗(控制台没开时的兜底), 不放声音
+    try{
+      const urg = rows.filter(function(r){return r.status==='pending'||r.status==='manual';});
+      const ids = urg.map(function(r){return r.id;});
+      if(arSeenUrgent===null){ arSeenUrgent=new Set(ids); }
+      else{
+        const fresh=urg.filter(function(r){return !arSeenUrgent.has(r.id);});
+        if(fresh.length){
+          const pop=document.getElementById('urgent-pop'), txt=document.getElementById('urgent-pop-text');
+          if(pop&&txt){ txt.textContent='⚠️ 紧急: '+urg.length+' 个待处理 — '+arEsc(fresh[0].title||fresh[0].slug||''); pop.style.display='block'; }
+        }
+        ids.forEach(function(id){arSeenUrgent.add(id);});
+      }
+    }catch(e){}
+    // 点亮持仓行的灯 (newest 优先, rows 已按 id DESC): 红=待你决策, 黄=调研中/已处理待清空
+    const litSeen = {};
+    rows.forEach(function(r){
+      if(litSeen[r.token_id]) return; litSeen[r.token_id]=1;
+      const el = document.querySelector('.ar-light[data-asset="'+r.token_id+'"]');
+      if(!el) return;
+      if(r.status==='pending'||r.status==='manual'){ el.className='ar-light on red'; el.title='自动重评: 待你处理'; }
+      else if(r.status==='analyzing'){ el.className='ar-light on yellow'; el.title='自动重评: 调研中'; }
+      else { el.className='ar-light on yellow'; el.title='自动重评: 已处理, 待清空'; }
+    });
+    // 卡片默认折叠: 只显示 名称 + 操作 + 状态 + 按钮; 「更多」展开全部细节
+    list.innerHTML = rows.map(function(r){
+      const loss = Math.round((r.loss_pct||0)*100);
+      const name = arEsc(r.title || r.slug || r.token_id);
+      if(r.status==='analyzing')
+        return arCard('🔬 <b>'+name+'</b> — 联网调研中…（亏 '+loss+'%, 约 0.5-2 分钟）<div style="margin-top:6px">'+arResetBtn(r.id)+'</div>', '#00c8ff');
+      if(r.status==='error')
+        return arCard('⚠️ <b>'+name+'</b> 调研失败 <span style="color:var(--tx3);font-size:11px">· 亏 '+loss+'%</span><div style="font-size:12px;color:var(--tx2);margin:5px 0">'+arEsc(r.error||'')+'</div>'+arResetBtn(r.id), '#ff4070');
+      if(r.status==='manual')
+        return arCard('📋 <b>'+name+'</b> — 你在线, 自动 API 已暂停 <span style="color:var(--tx3);font-size:11px">· 亏 '+loss+'% · 触发 '+arTime(r.created_at)+'</span><div style="font-size:12px;color:var(--tx2);margin:5px 0">手动重评: 复制提示词 → 贴给 Claude.ai → 按结果在下方持仓行改 q 或卖出, 然后点清空</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-small" onclick="copyReevalPrompt(\''+r.token_id+'\')">📋 复制提示词</button>'+arResetBtn(r.id)+'</div>', '#8060ff');
+      const act = r.action;
+      const actLabel = act==='exit' ? '🔴 清仓 (exit)' : act==='update_q' ? ('🟡 更新 q → '+Math.round((r.new_q||0)*100)+'%') : act==='cancel_autostop' ? '🛑 取消自动止损' : '🟢 继续持有 (hold)';
+      let statusTag;
+      if(r.status==='executed') statusTag = '<span style="color:#00e5a0;font-size:11px">✓ 已执行</span>';
+      else if(r.status==='dismissed') statusTag = '<span style="color:var(--tx3);font-size:11px">已忽略</span>';
+      else statusTag = '<span style="color:#ffc040;font-size:11px">⏳ 待确认</span>';
+      const borderColor = r.status==='pending' ? '#ffc040' : 'var(--bd)';
+      let buttons = '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">';
+      if(r.status==='pending')
+        buttons += '<button class="btn btn-primary btn-small" onclick="arConfirm('+r.id+')">✅ 确认执行</button><button class="btn btn-small" onclick="arDismiss('+r.id+')">✗ 忽略</button>';
+      buttons += arResetBtn(r.id) + '</div>';
+      const tbColor = r.thesis_broken ? '#ff4070' : 'var(--tx3)';
+      const tbText = r.thesis_broken ? '⚠️ 论点被推翻' : '论点未破';
+      const src = (r.sources||[]).slice(0,5).map(function(u){return '<a href="'+arEsc(u)+'" target="_blank" style="color:var(--ac)">来源</a>';}).join(' · ');
+      const det = '<div id="ar-det-'+r.id+'" style="display:'+(arOpen.has(r.id)?'block':'none')+';margin-top:6px;border-top:1px solid var(--bd);padding-top:6px">'
+        + '<div style="font-size:11px;color:var(--tx3);margin-bottom:4px">亏 '+loss+'% · 信心 '+arEsc(r.confidence||'?')+' · 触发 '+arTime(r.created_at)+' · <span style="color:'+tbColor+'">'+tbText+'</span>'+(r.provider?' · 由 '+arProv(r.provider)+' 决策':'')+'</div>'
+        + '<div style="font-size:12px;color:var(--tx2);margin-bottom:4px">'+arEsc(r.reason||'')+'</div>'
+        + (r.headline_event ? '<div style="font-size:11px;color:var(--tx3)">'+arEsc(r.headline_event)+(src?' · '+src:'')+'</div>' : (src?'<div style="font-size:11px">'+src+'</div>':''))
+        + '</div>';
+      return arCard(
+        '<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">'
+        + '<span style="font-weight:600">'+name+'</span> '+statusTag
+        + ' <span style="font-size:13px">'+actLabel+'</span>'
+        + '<button id="ar-more-'+r.id+'" class="btn-small" style="margin-left:auto" onclick="arToggle('+r.id+')">'+(arOpen.has(r.id)?'收起 ▴':'更多 ▾')+'</button>'
+        + '</div>' + det + buttons,
+        borderColor);
+    }).join('');
+  }catch(e){}
+}
+async function arConfirm(id){
+  if(!confirm('确认执行这条建议? (exit 会真的清仓卖出)')) return;
+  try{
+    const d = await (await fetch('/api/auto_reeval/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})).json();
+    showT(d.ok?'ok':'err', d.message||''); arLoad();
+    if(d.ok) setTimeout(function(){location.reload();}, 1300);
+  }catch(e){ showT('err','网络错误'); }
+}
+async function arDismiss(id){
+  try{ const d = await (await fetch('/api/auto_reeval/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})).json(); showT(d.ok?'ok':'err', d.message||''); arLoad(); }catch(e){}
+}
+async function arClear(id){
+  try{ const d = await (await fetch('/api/auto_reeval/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})).json(); showT(d.ok?'ok':'err', d.message||''); arLoad(); if(typeof arhLoad==='function') arhLoad(); }catch(e){}
+}
+async function arClearAll(){
+  if(!confirm('清空整个自动重评清单? (建议归档到「📜 重评历史」不会丢; 是否再自动评由 6h 冷却 + 基线再跌10pp 控制)')) return;
+  try{ const d = await (await fetch('/api/auto_reeval/clear_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})})).json(); showT(d.ok?'ok':'err', d.message||''); arLoad(); if(typeof arhLoad==='function') arhLoad(); }catch(e){}
+}
+async function arTestTrigger(){
+  const sel = document.getElementById('ar-test-sel'); const token = sel && sel.value;
+  if(!token){ showT('err','没有可选仓位'); return; }
+  const msg = document.getElementById('ar-test-msg'); if(msg) msg.textContent='触发中…';
+  try{
+    const d = await (await fetch('/api/auto_reeval/trigger',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token_id:token})})).json();
+    showT(d.ok?'ok':'err', d.message||'');
+    if(msg) msg.textContent = d.ok ? '已触发, 调研中, 每 15s 自动刷新…' : (d.message||'');
+    arLoad();
+  }catch(e){ showT('err','网络错误'); if(msg) msg.textContent=''; }
+}
+arLoad(); setInterval(arLoad, 15000);
+
+// ============ v6.0.6: 重评历史 + 冷却倒计时 ============
+let arhOpen = new Set();
+function arhToggle(id){ if(arhOpen.has(id)) arhOpen.delete(id); else arhOpen.add(id); var e=document.getElementById('arh-det-'+id); var b=document.getElementById('arh-more-'+id); var op=arhOpen.has(id); if(e) e.style.display=op?'block':'none'; if(b) b.textContent=op?'收起 ▴':'更多 ▾'; }
+function arhActLabel(r){ var a=r.action; return a==='exit'?'🔴 清仓':a==='update_q'?('🟡 q '+(r.orig_q!=null?Math.round(r.orig_q*100)+'%':'?')+' → '+Math.round((r.new_q||0)*100)+'%'):a==='cancel_autostop'?'🛑 取消止损':a==='hold'?'🟢 持有':'—'; }
+function arhStatusTag(r){ return '<span style="color:var(--tx3);font-size:10.5px;border:1px solid var(--bd);border-radius:4px;padding:1px 5px">已归档</span>'; }
+function fmtCd(ms){ if(ms<=0) return '0s'; var s=Math.floor(ms/1000); var h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60; if(h>0) return h+'h'+(m<10?'0':'')+m+'m'; if(m>0) return m+'m'+(ss<10?'0':'')+ss+'s'; return ss+'s'; }
+function arhCdBadge(r){
+  if(r.cd_state==='cooling'){ var rem=(r.cd_remaining_sec||0)*1000; return '<span class="arh-cd" style="color:#5ec8ff;font-size:11px;font-weight:600">❄️ 冷却中 · 还剩 <span class="cd-count" data-cdend="'+(r.cd_end_ms||0)+'">'+fmtCd(rem)+'</span></span>'; }
+  if(r.cd_state==='armed'){ var wl=(r.cd_watch_loss!=null)?(' · 基线 -'+Math.round(r.cd_watch_loss*100)+'%, 再跌 '+(window.__arhpp||10)+'pp 触发'):' · 下一拍记基线'; return '<span style="color:#00e5a0;font-size:11px;font-weight:600">✅ 冷却已过, 已就绪'+wl+'</span>'; }
+  if(r.cd_state==='inflight') return '<span style="color:#ffc040;font-size:11px">🔬 有进行中/待确认的评估</span>';
+  if(r.cd_state==='closed') return '<span style="color:var(--tx3);font-size:11px">仓位已平 (冷却无意义)</span>';
+  return '';  // superseded: 已被更新的记录取代, 不显示
+}
+function cdTick(){ document.querySelectorAll('.cd-count[data-cdend]').forEach(function(el){ var end=+el.getAttribute('data-cdend')||0; var rem=end-Date.now(); if(rem<=0){ var p=el.closest('.arh-cd'); if(p) p.innerHTML='✅ 冷却已过, 已就绪'; el.removeAttribute('data-cdend'); } else el.textContent=fmtCd(rem); }); }
+setInterval(cdTick, 1000);
+async function arhLoad(){
+  try{
+    const d = await (await fetch('/api/auto_reeval/history')).json();
+    if(!d.ok) return;
+    window.__arhpp = d.retrigger_pp || 10;
+    var hh=document.getElementById('ar-hist-h'); if(hh) hh.textContent = d.cooldown_h||6;
+    var pp=document.getElementById('ar-hist-pp'); if(pp) pp.textContent = d.retrigger_pp||10;
+    const rows = d.rows || [];
+    const cnt=document.getElementById('ar-hist-cnt'); if(cnt) cnt.textContent = rows.length? '('+rows.length+' 条)':'';
+    const list=document.getElementById('ar-hist-list'), empty=document.getElementById('ar-hist-empty');
+    if(!list) return;
+    if(!rows.length){ list.innerHTML=''; if(empty) empty.style.display=''; return; }
+    if(empty) empty.style.display='none';
+    list.innerHTML = rows.map(function(r){
+      var name=arEsc(r.title||r.slug||r.token_id);
+      var loss=Math.round((r.loss_pct||0)*100);
+      var tb = r.thesis_broken ? ' <span style="color:#ff4070">⚠️论点破</span>' : '';
+      var src = (r.sources||[]).slice(0,5).map(function(u){return '<a href="'+arEsc(u)+'" target="_blank" style="color:var(--ac)">来源</a>';}).join(' · ');
+      var cd = arhCdBadge(r);
+      var det = '<div id="arh-det-'+r.id+'" style="display:'+(arhOpen.has(r.id)?'block':'none')+';margin-top:6px;border-top:1px solid var(--bd);padding-top:6px">'
+        + '<div style="font-size:11px;color:var(--tx3);margin-bottom:4px">亏 '+loss+'% · 信心 '+arEsc(r.confidence||'?')+(r.provider?' · 由 '+arProv(r.provider)+' 决策':'')+' · 触发 '+arTime(r.created_at)+(r.decided_at?(' · 决策 '+arTime(r.decided_at)):'')+(r.resolved_at?(' · 清空 '+arTime(r.resolved_at)):'')+tb+'</div>'
+        + (r.reason?'<div style="font-size:12px;color:var(--tx2);margin-bottom:4px">'+arEsc(r.reason)+'</div>':'')
+        + (r.headline_event?'<div style="font-size:11px;color:var(--tx3)">'+arEsc(r.headline_event)+(src?' · '+src:'')+'</div>':(src?'<div style="font-size:11px">'+src+'</div>':''))
+        + '</div>';
+      return arCard(
+        '<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">'
+        + '<span style="font-weight:600;font-size:12.5px">'+name+'</span> '+arhStatusTag(r)
+        + ' <span style="font-size:12.5px">'+arhActLabel(r)+'</span>'
+        + (cd?'<span style="margin-left:6px">'+cd+'</span>':'')
+        + '<button id="arh-more-'+r.id+'" class="btn-small" style="margin-left:auto" onclick="arhToggle('+r.id+')">'+(arhOpen.has(r.id)?'收起 ▴':'更多 ▾')+'</button>'
+        + '</div>' + det,
+        'var(--bd)');
+    }).join('');
+    cdTick();
+  }catch(e){}
+}
+// 历史栏: 展开时刷新一次 + 每 30s 刷新 (折叠时也刷, 量小; 倒计时本地每秒 tick)
+var arhWrap=document.getElementById('ar-hist-wrap');
+if(arhWrap) arhWrap.addEventListener('toggle', function(){ if(arhWrap.open) arhLoad(); });
+arhLoad(); setInterval(arhLoad, 30000);
+
+// ============ v5.14: 在线/离线 presence (在线暂停自动 API, 改手动省钱) ============
+let presOnline = false, presManualOff = false, presOnlining = false;
+const IDLE_MODAL_SEC = 600;   // v7.x(#20): 10 分钟无人为操作(不含鼠标移动)才弹"还在吗" (主页/总控台同源, 由服务器 idle_sec 驱动)
+function presRender(p){
+  presOnline = !!(p && p.effective_online);
+  presManualOff = !!(p && p.manual_off);   // v5.16: 服务器说"用户手动下线了" → 活动不自动上线
+  const b = document.getElementById('pres-btn');
+  if(b){
+    if(presOnline){ b.textContent='🟢 在线 (自动API暂停)'; b.style.background='rgba(0,229,160,0.15)'; b.style.color='#00a884'; }
+    else { b.textContent='⚪ 不在线 (自动API接管)'; b.style.background=''; b.style.color=''; }
+  }
+  // v5.16: "还在吗"弹窗显隐完全由服务器 idle_sec 驱动 → 任一页(主页/总控台)有活动或点确认刷新 presence_at 后, 两页下次轮询都收起; 满 30min 两页同时弹。
+  const idle = p && p.idle_sec;
+  if(presOnline && idle!=null && idle >= IDLE_MODAL_SEC){ presShowAsk(); } else { presHideAsk(); }
+}
+async function apiModeLoad(){ try{ var d=await (await fetch('/api/api_paused')).json(); apiModeRender(d.paused); }catch(e){} }
+function apiModeRender(paused){ var b=document.getElementById('apimode-btn'); if(!b)return; b.dataset.paused=paused?'1':'0'; if(paused){ b.textContent='🛑 API已暂停'; b.style.background='rgba(255,64,112,0.22)'; b.style.color='#ff5d7e'; b.style.borderColor='rgba(255,64,112,0.65)'; } else { b.textContent='🤖 API'; b.style.background=''; b.style.color=''; b.style.borderColor=''; } }
+async function apiModeToggle(){ var b=document.getElementById('apimode-btn'); var want=!(b&&b.dataset.paused==='1'); if(want){ if(!confirm('🛑 紧急暂停所有自动重评 API?\n\n暂停后:\n· 自动触发 / 手动 🤖 / 离线自动执行 全部停\n· 持仓不会因此盲卖, 会冻结在「等重评」(只 $0.05 地板兜底)\n· 随时再点一下即可恢复\n\n确认暂停?')) return; } else { if(!confirm('▶ 恢复自动重评 API? 自动重评会重新开始工作。')) return; } try{ var d=await (await fetch('/api/api_paused',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:want})})).json(); apiModeRender(d.paused); showT(d.ok?'ok':'err', d.message||''); }catch(e){ showT('err','切换失败'); } }
+async function presLoad(){ try{ const d=await (await fetch('/api/presence')).json(); if(d.ok) presRender(d); }catch(e){} }
+async function presToggle(){
+  try{
+    const d=await (await fetch('/api/presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({online:!presOnline,manual:true})})).json();
+    if(d.ok){ presRender(d); showT('ok', d.effective_online?'已设为在线 — 自动 API 暂停, 触发的仓位会给你手动提示词':'已设为离线 — 自动 API 接管'); }
+  }catch(e){ showT('err','网络错误'); }
+}
+async function presPing(){ try{ await fetch('/api/presence/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})}); }catch(e){} }
+// ===== v5.16: 活动驱动 + 双页同步的"还在吗" =====
+// 任何人为操作(滚动/键盘/鼠标/点击/触摸) = 我在 → 节流 ping 刷新服务器 presence_at(= 重置 30 分钟空闲钟)。
+// 弹窗显隐由 presRender 按服务器 idle_sec 判 → 主页 + 总控台 同步: 任一页有活动两页都不弹; 满 30min 两页同时弹; 任一页点"我在"或有活动 → 两页都收起。
+// 60s 不点 → 转离线(自动 API 接管); 过期前再查一次, 若已被别处刷新就不下线只收起(防竞态误下线)。
+let presAskTimer=null, presLastPing=0;
+function presModalEl(){ return document.getElementById('pres-modal'); }
+function presModalOpen(){ const m=presModalEl(); return !!(m && m.style.display==='flex'); }
+function presActivity(){
+  if(presOnline){ const now=Date.now(); if(now-presLastPing>=60000){ presLastPing=now; presPing(); } return; }
+  // v5.16: 离线时, 只要没被"手动下线"抑制, 任何人为操作就自动上线 (开局 / 超时回来都不用先点在线)。服务器再兜一道(auto=true)防竞态。
+  if(presManualOff || presOnlining) return;
+  presOnlining=true;
+  fetch('/api/presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({online:true,auto:true})})
+    .then(function(r){return r.json();}).then(function(d){ if(d&&d.ok){ presLastPing=Date.now(); presRender(d); } })
+    .catch(function(){}).finally(function(){ presOnlining=false; });
+}
+function presShowAsk(){
+  const m=presModalEl(); if(!m||presModalOpen()) return;
+  m.style.display='flex';
+  let left=60; const cd=document.getElementById('pres-countdown'); if(cd) cd.textContent=left;
+  clearInterval(presAskTimer);
+  presAskTimer=setInterval(function(){ left--; if(cd) cd.textContent=Math.max(0,left); if(left<=0){ clearInterval(presAskTimer); presAskTimer=null; presExpire(); } },1000);
+}
+function presHideAsk(){ clearInterval(presAskTimer); presAskTimer=null; const m=presModalEl(); if(m) m.style.display='none'; }
+async function presExpire(){
+  try{ const d=await (await fetch('/api/presence')).json();
+    if(d.ok && d.idle_sec!=null && d.idle_sec < IDLE_MODAL_SEC){ presHideAsk(); presRender(d); return; }
+  }catch(e){}
+  presHideAsk();
+  fetch('/api/presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({online:false})}).then(function(){presLoad();});
+}
+function presStillHere(){ presHideAsk(); presLastPing=Date.now(); presPing(); setTimeout(presLoad,200); }
+['scroll','keydown','click','touchstart'].forEach(function(ev){ window.addEventListener(ev, presActivity, {passive:true}); });  // v7.x(#20): 去掉 mousemove(太敏感, 鼠标微动就一直判在线) — 只认真操作
+// v5.16: 页面加载 = 新会话 → 先解除"手动下线"抑制(本次活动可自动上线, 开局不用先点在线), 再开始轮询。
+(async function(){ try{ const d=await (await fetch('/api/presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({arm:true})})).json(); if(d&&d.ok) presRender(d); }catch(e){} presLoad(); })();
+setInterval(presLoad, 15000);
+apiModeLoad(); setInterval(apiModeLoad, 8000);
+
+// v5.9: 入场金额建议公式调用
+async function calcSize(){
+  const q=parseFloat(document.getElementById('sg-q').value)/100;
+  const p=parseFloat(document.getElementById('sg-p').value)/100;
+  const conf=document.getElementById('sg-conf').value;
+  const tier=document.getElementById('sg-tier').value;
+  const days=parseInt(document.getElementById('sg-days').value);
+  const cluster=document.getElementById('sg-cluster').value.trim();
+  if(isNaN(q)||isNaN(p)||isNaN(days)){
+    document.getElementById('sg-result').innerHTML='<span style="color:var(--rd)">⚠️ q / p / days 必填</span>';return;
+  }
+  const url=`/api/suggested_size?q=${q}&p=${p}&confidence=${conf}&tier=${tier}&days=${days}&cluster=${encodeURIComponent(cluster)}`;
+  try{
+    const r=await fetch(url);
+    // v5.9: 友好处理 auth 失败 (被 middleware 302/401 而非真网络错)
+    if(r.redirected || r.status === 401){
+      document.getElementById('sg-result').innerHTML='<span style="color:var(--rd)">⚠️ session 过期或浏览器插件干扰. <a href="/login" style="color:var(--ac)">点这里重新登录</a></span>';return;
+    }
+    if(!r.ok){
+      document.getElementById('sg-result').innerHTML='<span style="color:var(--rd)">HTTP '+r.status+' '+r.statusText+'</span>';return;
+    }
+    const d=await r.json();
+    if(!d.ok){
+      document.getElementById('sg-result').innerHTML='<span style="color:var(--rd)">'+(d.message||'失败')+'</span>';return;
+    }
+    const big=d.size_usd>0
+      ? `<div style="font-size:20px;color:#00e5a0;font-weight:700;margin-bottom:6px">推荐 $${d.size_usd.toFixed(2)}</div>`
+      : `<div style="font-size:18px;color:#ff4070;font-weight:600;margin-bottom:6px">不建议入场 ($0)</div>`;
+    const ctx=`<div style="color:var(--tx3);font-size:10px">${d.reason}</div>
+<div style="margin-top:6px;font-size:10px;color:var(--tx3)">
+bankroll <b style="color:var(--tx2)">$${d.bankroll_usd.toFixed(2)}</b> ·
+cluster <b style="color:var(--ac)">${d.cluster_id||'(无)'}</b> 暴露 <b style="color:var(--tx2)">$${d.cluster_exposure_usd.toFixed(2)}</b> / cap $${d.cluster_cap_usd.toFixed(2)} ·
+DD 余预算 <b style="color:var(--tx2)">$${d.dd_budget_remaining_usd.toFixed(2)}</b>
+</div>`;
+    document.getElementById('sg-result').innerHTML=big+ctx;
+    cjPersistCalc();  // v5.12: 推荐金额持久化 (刷新不丢)
+    // 注: 不再设置 sg-context-bankroll/sg-context-dd 的 textContent —
+    // 它俩是 sg-result 内的占位 span, 上面 innerHTML 覆盖时已经被移除.
+    // bankroll / DD 余预算信息在 ctx 字符串里已经显示, 不重复.
+  }catch(e){
+    // v5.9 诊断版: 把完整错误回传 server, 同时 UI 显示能截图给开发者看的全部上下文
+    const errDetail = (e&&e.name||'?')+': '+(e&&e.message||'?');
+    console.error('[calcSize] fetch failed:', e);
+    // 回传 server 让 bot.log 也能看到
+    try{
+      fetch('/api/client_log',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({where:'calcSize', url:url, err:errDetail, stack:(e&&e.stack||'').slice(0,500)})});
+    }catch(_){}
+    document.getElementById('sg-result').innerHTML=
+      '<div style="color:var(--rd);font-size:11px"><b>请求失败</b>: '+errDetail+'</div>'+
+      '<div style="font-size:10px;color:var(--tx3);margin-top:4px;word-break:break-all">url: '+url+'</div>'+
+      '<div style="font-size:10px;color:var(--tx3);margin-top:4px">已把错误传到 bot.log, 让开发者排查. 按 F12 看 Console / Network 也能看更多.</div>';
+  }
+}
+
+// v5.9: 保存单仓位 cluster_id
+function saveCluster(btn, tokenId){
+  const row=btn.closest('.cluster-row');
+  const input=row.querySelector('.cluster-input');
+  const cluster_id=input.value.trim();
+  fetch('/api/update_cluster',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token_id:tokenId, cluster_id:cluster_id})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      showT('ok','已保存: '+(d.cluster_id||'(清除)')+' · 该 cluster 暴露 $'+d.new_cluster_exposure_usd);
+      loadClusterSummary();
+    }else{showT('err',d.message||'保存失败')}
+  }).catch(()=>showT('err','网络失败'));
+}
+
+// v5.8 增量: 重评模式一键全部就绪
+function reevalReadyAll(){
+  const btns=document.querySelectorAll('.reeval-copy-btn');
+  let n=0;
+  btns.forEach(b=>{
+    if(!b.classList.contains('ready')){b.classList.add('ready');n++}
+  });
+  showT('ok','已标记 '+n+' 个就绪. 一个一个点 📋 复制');
+}
+
+// v5.8 增量: 重评模式重置所有标记
+function reevalResetMarks(){
+  const btns=document.querySelectorAll('.reeval-copy-btn.ready');
+  let n=btns.length;
+  btns.forEach(b=>b.classList.remove('ready'));
+  showT('ok','已重置 '+n+' 个 ✓');
+}
+
+// v5.8 增量: 重评模式单个复制 (复制完自动清 ✓)
+function copyReevalPromptMarked(btn, tokenId){
+  fetch('/api/reeval_prompt?token_id='+tokenId)
+    .then(r=>r.json()).then(d=>{
+      if(!d.ok){showT('err',d.message||'生成失败');return}
+      const doMark=()=>{btn.classList.remove('ready')};
+      if(navigator.clipboard&&window.isSecureContext){
+        navigator.clipboard.writeText(d.prompt).then(()=>{doMark();showT('ok','已复制 ('+d.prompt.length+' 字符) → Claude.ai')}).catch(()=>showT('err','复制失败'));
+      } else {
+        const a=document.createElement('textarea');
+        a.value=d.prompt;a.style.position='fixed';a.style.left='-9999px';
+        document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a);
+        doMark();showT('ok','已复制 → Claude.ai');
+      }
+    }).catch(()=>showT('err','网络失败'));
+}
+
+function markReevalHold(tokenId){
+  if(!confirm('维持当前 q 不变. 继续?')) return;
+  fetch('/api/update_q',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token_id:tokenId, new_q:null, reason:'reeval_hold_no_change'})
+  }).then(r=>r.json()).then(d=>{
+    showT(d.ok?'ok':'err', d.message||(d.ok?'已记录':'失败'));
+    if(d.ok) setTimeout(()=>location.reload(), 1500);
+  });
+}
+
+function submitNewQ(tokenId){
+  const inp = document.getElementById('newq-' + tokenId);
+  if(!inp) return;
+  const v = parseFloat(inp.value);
+  if(isNaN(v) || v <= 0 || v >= 100){ showT('err', '请输入百分比 (1-99)'); return; }
+  const new_q = v / 100;
+  if(!confirm('更新 q 为 ' + v + '% (= ' + new_q.toFixed(3) + '). 确认?')) return;
+  fetch('/api/update_q',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token_id:tokenId, new_q:new_q, reason:'reeval_user_update'})
+  }).then(r=>r.json()).then(d=>{
+    showT(d.ok?'ok':'err', d.message||(d.ok?'已更新':'失败'));
+    if(d.ok) setTimeout(()=>location.reload(), 1500);
+  });
+}
+
+function reevalExit(tokenId, title, size, curPrice){
+  // 用户在重评里选了 exit, 走 force_exit 整笔清仓
+  // 绕过 monitor_state 校验, 因为 reeval 决定就直接 sell
+  const expectedRecv = (size * curPrice).toFixed(3);
+  const msg = '建议清仓 (Claude 推荐 exit)\n\n' +
+              '标的: ' + title + '\n' +
+              '动作: 整笔清仓 (' + size + ' 股)\n' +
+              '当前价: $' + curPrice.toFixed(3) + '\n' +
+              '预计收回: ~$' + expectedRecv + '\n\n' +
+              '确认?';
+  if(!confirm(msg)) return;
+  fetch('/api/force_exit',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token_id:tokenId, reason:'reeval_exit'})
+  }).then(r=>r.json()).then(d=>{
+    showT(d.ok?'ok':'err', d.message||(d.ok?'已执行':'失败'));
+    if(d.ok) setTimeout(()=>location.reload(), 1500);
+  });
+}
+
+function executeState(tokenId, state, title, size, curPrice){
+  let action_text = "";
+  let sell_size = size;
+  if(state === "AT_TARGET"){
+    action_text = "整笔清仓 (" + size + " 股) - 价格已达目标";
+  }
+  const expectedRecv = (sell_size * curPrice).toFixed(3);
+  const msg = "确认执行: " + state + "\n\n" +
+              "标的: " + title + "\n" +
+              "动作: " + action_text + "\n" +
+              "当前价: $" + curPrice.toFixed(3) + "\n" +
+              "预计收回: ~$" + expectedRecv + " (按当前价估算, 实际按最优 bid 成交)\n\n" +
+              "确认?";
+  if(!confirm(msg)) return;
+  fetch('/api/execute_state',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token_id:tokenId, state:state})
+  }).then(r=>r.json()).then(d=>{
+    showT(d.ok?'ok':'err', d.message||(d.ok?'已执行':'失败'));
+    if(d.ok) setTimeout(()=>location.reload(), 1500);
+  }).catch(()=>showT('err','网络失败'));
+}
+
+
+
+
+async function addPosition(tokenId, side, title){
+  const inp = document.getElementById('addusd-' + tokenId);
+  const usd = parseFloat(inp.value);
+  if(!usd || usd < 1){ showT('err','请输入 ≥$1 的金额'); inp.focus(); return; }
+  showT('ok','拉盘口预览...');
+  try{
+    const r = await fetch(`/api/buy_preview?token_id=${tokenId}&usd=${usd}`);
+    const pv = await r.json();
+    if(!pv.ok){ showT('err', pv.message || '预览失败'); return; }
+    const askPct = (pv.best_ask*100).toFixed(1);
+    const ok = confirm(`确认加仓?\n\n${title}\n方向: ${side}\n金额: $${usd.toFixed(2)}\n@ ${askPct}% (best_ask)\n→ 约 ${pv.size} 股 (实际成交 $${pv.estimated_cost.toFixed(2)})`);
+    if(!ok){ showT('ok','已取消'); return; }
+    showT('ok','下单中...');
+    const r2 = await fetch('/api/buy_position', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({token_id: tokenId, usd_amount: usd, reason: 'manual_add'})
+    });
+    const d = await r2.json();
+    showT(d.ok?'ok':'err', d.message || (d.ok?'加仓成功':'加仓失败'));
+    if(d.ok){ inp.value=''; setTimeout(syncSnapshot, 1500); }
+  }catch(e){ showT('err','请求失败: ' + e.message); }
+}
+
+function forceLiquidate(tokenId, title, size, curPrice){
+  const ok = confirm(`确认清仓?\n\n${title}\n卖出全部 ${size} 股 @ ~${(curPrice*100).toFixed(1)}% (best_bid)\n≈ $${(size*curPrice).toFixed(2)}`);
+  if(!ok){ showT('ok','已取消'); return; }
+  showT('ok','清仓下单中...');
+  fetch('/api/force_exit', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({token_id: tokenId, reason: 'manual_liquidate'})
+  }).then(r=>r.json()).then(d=>{
+    showT(d.ok?'ok':'err', d.message || (d.ok?'清仓完成':'清仓失败'));
+    if(d.ok) setTimeout(syncSnapshot, 1500);
+  }).catch(e=>showT('err','请求失败: ' + e.message));
+}
+
+// v5.10.1: 切换"禁用自动止盈". 关闭后 monitor 跳过 TAKE_PROFIT_PRICE+PNL,
+// 仓位可以一直跑到 1.0 不会被自动锁止盈卖出. 止损/TIME_STOP/edge-based 仍生效.
+function toggleTakeProfit(tokenId, disabled){
+  const word = disabled ? '关闭止盈' : '恢复止盈';
+  const detail = disabled
+    ? '关闭后, 即使 best_bid 涨到 90¢ 或浮盈 +100%, monitor 都不会自动卖.\n止损/TIME_STOP/edge 仍生效.'
+    : '恢复后, 90¢ 或 +100% 浮盈会触发自动全卖.';
+  if(!confirm(`${word}?\n\n${detail}`)){ showT('ok','已取消'); return; }
+  fetch('/api/toggle_take_profit', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({token_id: tokenId, disabled: disabled})
+  }).then(r=>r.json()).then(d=>{
+    showT(d.ok?'ok':'err', d.message || (d.ok?word+'成功':word+'失败'));
+    if(d.ok){
+      // 不刷整页, 就地切按钮样式 + onclick
+      const btn = document.getElementById('tp-btn-' + tokenId);
+      if(btn){
+        if(disabled){
+          btn.textContent = '🚫止盈OFF';
+          btn.title = '此仓位已关止盈, 90¢/+100% 不会自动触发. 点击恢复.';
+          btn.style.background = 'rgba(128,96,255,0.18)';
+          btn.style.color = 'var(--vi)';
+          btn.style.borderColor = 'rgba(128,96,255,0.55)';
+          btn.setAttribute('onclick', `toggleTakeProfit('${tokenId}',0)`);
+        } else {
+          btn.textContent = '🔔止盈ON';
+          btn.title = '关闭自动止盈: 即使 best_bid≥90¢ 或浮盈+100% 也不卖. 止损/TIME_STOP/edge 仍生效.';
+          btn.style.background = 'var(--sf)';
+          btn.style.color = 'var(--tx3)';
+          btn.style.borderColor = 'var(--bd)';
+          btn.setAttribute('onclick', `toggleTakeProfit('${tokenId}',1)`);
+        }
+      }
+    }
+  }).catch(e=>showT('err','请求失败: ' + e.message));
+}
+
+// v5.16: 切换"关闭此仓全部自动止损". 关闭(OFF)后 monitor 跳过 %止损线 + 不触发亏损自动重评,
+// 只留 $0.05 地板兜底防真归零. TIME_STOP / 止盈 不受影响. OFF 状态按钮标红.
+function toggleAutoStop(tokenId, disabled){
+  if(disabled){
+    if(!confirm('关闭此仓全部自动止损?\n\n关闭后: %止损线 + 亏损自动重评 全部失效, 价格再跌也不会自动卖.\n只保留 $0.05 地板兜底 (防真归零).\nTIME_STOP / 止盈 不受影响.')){ showT('ok','已取消'); return; }
+  }
+  fetch('/api/toggle_auto_stop', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({token_id: tokenId, disabled: disabled})
+  }).then(r=>r.json()).then(d=>{
+    showT(d.ok?'ok':'err', d.message || (d.ok?'已更新':'更新失败'));
+    if(d.ok){
+      const btn = document.getElementById('sl-btn-' + tokenId);
+      if(btn){
+        if(disabled){
+          btn.textContent = '🛑止损OFF';
+          btn.title = '此仓自动止损已关 — %止损/亏损重评全失效, 只留 $0.05 地板兜底防归零. 点击恢复止损.';
+          btn.style.background = 'rgba(255,64,112,0.18)';
+          btn.style.color = 'var(--rd)';
+          btn.style.borderColor = 'rgba(255,64,112,0.55)';
+          btn.setAttribute('onclick', `toggleAutoStop('${tokenId}',0)`);
+        } else {
+          btn.textContent = '🛡止损ON';
+          btn.title = '关闭此仓全部自动止损 (%止损 + 亏损自动重评 全失效, 只留 $0.05 地板兜底). TIME_STOP/止盈 不受影响.';
+          btn.style.background = 'var(--sf)';
+          btn.style.color = 'var(--tx3)';
+          btn.style.borderColor = 'var(--bd)';
+          btn.setAttribute('onclick', `toggleAutoStop('${tokenId}',1)`);
+        }
+      }
+      const badge = document.getElementById('slbadge-' + tokenId);
+      if(badge) badge.style.display = disabled ? '' : 'none';
+    }
+  }).catch(e=>showT('err','请求失败: ' + e.message));
+}
+
+function saveConf(tokenId,value){
+  fetch('/api/update_confidence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token_id:tokenId,confidence:value})})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok&&d.rows>0)showT('ok','信心已保存: '+(value||'(空)'));
+      else if(d.ok)showT('err','请先保存 TP, 信心未持久化');
+      else showT('err',d.message||'保存失败');
+    }).catch(()=>showT('err','保存失败'))
+}
+
+function saveTier(tokenId,value){
+  fetch('/api/update_tier',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token_id:tokenId,stop_loss_tier:value})})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok&&d.rows>0)showT('ok','止损档已保存: '+(value||'(空)'));
+      else if(d.ok)showT('err','请先保存 TP, 止损档未持久化');
+      else showT('err',d.message||'保存失败');
+    }).catch(()=>showT('err','保存失败'))
+}
+
+function saveTP(tokenId,slug,side,entryPrice,idx,endDate,size){
+  const confEl=document.getElementById('conf-'+idx);
+  const confidence=confEl?confEl.value:'';
+  const tierEl=document.getElementById('tier-'+idx);
+  const stopLossTier=tierEl?tierEl.value:'';
+  const tpVal=document.getElementById('tp-'+idx).value;
+  if(!tpVal||isNaN(parseFloat(tpVal))){showT('err','请输入百分比 (1-99)');return}
+  const tpPct=parseFloat(tpVal);
+  if(tpPct<=0||tpPct>=100){showT('err','百分比必须在1-99之间');return}
+  const tp=tpPct/100;
+  // v5.15 漏填提醒: 止损档/信心/cluster 漏任一 → 弹窗提醒(可选仍保存)。防 legacy。
+  const clEl=document.querySelector('.cluster-input[data-asset="'+tokenId+'"]');
+  const cluster=clEl?clEl.value.trim():'';
+  const missing=[];
+  if(!confidence) missing.push('信心');
+  if(!stopLossTier) missing.push('止损档');
+  if(!cluster) missing.push('cluster');
+  if(missing.length && !confirm('⚠️ 你漏填了: '+missing.join(' / ')+'\n(止损档不填会变成 legacy 兜底止损。)\n仍然保存吗?')) return;
+  fetch('/api/record_position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    token_id:tokenId,slug:slug,side:side,entry_price:entryPrice,tp:tp,end_date:endDate,size:size,original_confidence:confidence,stop_loss_tier:stopLossTier
+  })}).then(r=>r.json()).then(d=>{showT(d.ok?'ok':'err',d.message||'已保存 TP='+tpPct+'%')}).catch(()=>showT('err','保存失败'))
+}
+
+let portfolioChart=null;let currentRange='1d';
+const RANGE_LABELS={'1d':'1D 变化 · 当前组合 − 24h 前','1w':'1W 变化 · 当前组合 − 一周前','1m':'1M 变化 · 当前组合 − 30 天前','1y':'1Y 变化 · 当前组合 − 一年前','ytd':'YTD · 当前组合 − 年初','all':'全部 · 当前组合 − 首次记录'};
+function setChartDelta(idx){
+  const dEl=document.getElementById('chart-delta');
+  const lEl=document.getElementById('chart-delta-label');
+  const pts=portfolioChart?portfolioChart.data.datasets[0].data:[];
+  if(!pts||pts.length===0){
+    if(dEl){dEl.textContent='$0.00';dEl.style.color='#5858a0'}
+    if(lEl)lEl.textContent=RANGE_LABELS[currentRange]||'';
+    return;
+  }
+  const t=(idx==null)?pts.length-1:idx;
+  const delta=pts[t].y-pts[0].y;
+  if(dEl){
+    dEl.textContent=(delta>=0?'+$':'-$')+Math.abs(delta).toFixed(2);
+    dEl.style.color=delta>=0?'#00e5a0':'#ff4070';
+  }
+  if(lEl){
+    if(idx==null){
+      lEl.textContent=RANGE_LABELS[currentRange]||'';
+    }else{
+      const dt=new Date(pts[t].x);
+      lEl.textContent=dt.toLocaleString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})+' · 当时组合 − 起点组合';
+    }
+  }
+}
+async function loadChart(range){
+  currentRange=range;
+  document.querySelectorAll('.range-btn[data-range]').forEach(b=>b.classList.toggle('active',b.dataset.range===range));
+  try{
+    const r=await fetch('/api/portfolio_history?range='+range);
+    const d=await r.json();
+    if(!d.ok)return;
+    const pts=d.points||[];
+    // 资产总值(持仓现值+现金) vs 成本线(持仓成本+现金) → 二者之差 = 持仓浮盈亏, 用于绿/红盈亏区
+    const valuePts=pts.map(p=>({x:p.ts*1000,y:p.assets_total}));
+    const costPts=pts.map(p=>({x:p.ts*1000,y:(p.total_cost!=null&&p.cash!=null)?(p.total_cost+p.cash):null}));
+    if(portfolioChart){
+      portfolioChart.data.datasets[0].data=valuePts;
+      portfolioChart.data.datasets[1].data=costPts;
+      portfolioChart.update('none');
+      setChartDelta(null);
+      return;
+    }
+    if(typeof Chart==='undefined'){console.warn('Chart.js not loaded');return}
+    const ctx=document.getElementById('portfolio-canvas').getContext('2d');
+    const gProfit=ctx.createLinearGradient(0,0,0,260);
+    gProfit.addColorStop(0,'rgba(0,229,160,0.34)');gProfit.addColorStop(1,'rgba(0,229,160,0.02)');
+    const gLoss=ctx.createLinearGradient(0,0,0,260);
+    gLoss.addColorStop(0,'rgba(255,64,112,0.03)');gLoss.addColorStop(1,'rgba(255,64,112,0.30)');
+    portfolioChart=new Chart(ctx,{
+      type:'line',
+      data:{datasets:[
+        {label:'资产总值',data:valuePts,borderColor:'#22d3ee',fill:{target:1,above:gProfit,below:gLoss},tension:0.35,pointRadius:0,pointHoverRadius:5,borderWidth:2.5},
+        {label:'成本线',data:costPts,borderColor:'rgba(150,150,190,0.55)',borderDash:[5,4],borderWidth:1.3,fill:false,tension:0.35,pointRadius:0,pointHoverRadius:0}
+      ]},
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        interaction:{mode:'index',intersect:false},
+        onHover:(e,active)=>{const v=active.find(a=>a.datasetIndex===0);setChartDelta(v?v.index:null);},
+        plugins:{
+          legend:{display:true,labels:{color:'#8888c0',font:{size:10},usePointStyle:true,boxWidth:8,padding:12}},
+          tooltip:{
+            backgroundColor:'rgba(17,17,40,0.95)',borderColor:'#1e1e4a',borderWidth:1,
+            titleColor:'#e8e8ff',bodyColor:'#cfeef8',padding:10,
+            filter:(item)=>item.parsed.y!=null,
+            callbacks:{
+              title:(items)=>{const dt=new Date(items[0].parsed.x);return dt.toLocaleString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})},
+              label:(item)=>{
+                const di=item.datasetIndex;
+                if(di===0)return '资产总值: $'+item.parsed.y.toFixed(2);
+                if(di===1)return '成本线: $'+item.parsed.y.toFixed(2);
+                return '';
+              }
+            }
+          }
+        },
+        scales:{
+          x:{type:'time',ticks:{color:'#5858a0',font:{size:10},maxRotation:0,autoSkipPadding:20},grid:{color:'rgba(255,255,255,0.04)'}},
+          y:{ticks:{color:'#5858a0',font:{size:10},callback:v=>'$'+v.toFixed(0)},grid:{color:'rgba(255,255,255,0.04)'}}
+        }
+      }
+    });
+    document.getElementById('portfolio-canvas').addEventListener('mouseleave',()=>setChartDelta(null));
+    setChartDelta(null);
+  }catch(e){console.error('chart load failed',e)}
+}
+window.addEventListener('load',()=>loadChart('1d'));
+setInterval(()=>loadChart(currentRange),60000);
+
+let moverTab='realtime';let moverRange='1d';let realtimeRange='1h';let moverExpanded=false;let metricMode='pp';let lastMovers=null;let lastValueRank=null;let lastRealtime=null;
+function switchMoverTab(tab){
+  moverTab=tab;
+  document.querySelectorAll('.range-btn[data-mtab]').forEach(b=>b.classList.toggle('active',b.dataset.mtab===tab));
+  document.getElementById('realtime-section').style.display=tab==='realtime'?'':'none';
+  document.getElementById('movers-section').style.display=tab==='movers'?'':'none';
+  document.getElementById('value-section').style.display=tab==='value'?'':'none';
+  document.getElementById('realtime-range-group').style.display=tab==='realtime'?'flex':'none';
+  document.getElementById('movers-range-group').style.display=tab==='movers'?'flex':'none';
+  document.getElementById('metric-toggle-group').style.display=tab==='value'?'none':'flex';
+  if(tab==='realtime')loadRealtime(realtimeRange);
+  else if(tab==='value')loadValueRank();
+  else loadMovers(moverRange);
+}
+function setMetricMode(m){
+  metricMode=m;
+  document.querySelectorAll('.range-btn[data-metric]').forEach(b=>b.classList.toggle('active',b.dataset.metric===m));
+  if(moverTab==='realtime'&&lastRealtime)renderRealtimeInto(lastRealtime);
+  else if(moverTab==='movers'&&lastMovers)renderMoversInto(lastMovers);
+}
+function toggleMoverExpanded(){
+  moverExpanded=!moverExpanded;
+  document.getElementById('mover-more-btn').textContent=moverExpanded?'Less':'More';
+  if(moverTab==='realtime'&&lastRealtime)renderRealtimeInto(lastRealtime);
+  else if(moverTab==='movers'&&lastMovers)renderMoversInto(lastMovers);
+  else if(moverTab==='value'&&lastValueRank)renderValueInto(lastValueRank);
+}
+function refreshMoverTab(){
+  if(moverTab==='realtime')loadRealtime(realtimeRange,true);
+  else if(moverTab==='movers')loadMovers(moverRange,true);
+  else loadValueRank(true);
+}
+async function loadRealtime(range,force){
+  realtimeRange=range;
+  document.querySelectorAll('.range-btn[data-rtrange]').forEach(b=>b.classList.toggle('active',b.dataset.rtrange===range));
+  const el=document.getElementById('realtime-list');
+  if(el)el.innerHTML='<div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div>';
+  try{
+    const r=await fetch('/api/realtime_movers?range='+range+(force?'&force=1':''));
+    const d=await r.json();
+    if(!d.ok)return;
+    lastRealtime=d;
+    renderRealtimeInto(d);
+  }catch(e){console.error('realtime load failed',e)}
+}
+function renderRealtimeInto(d){
+  let items=(d.items||[]).slice();
+  if(metricMode==='dollar')items.sort((a,b)=>Math.abs(b.change_dollar||0)-Math.abs(a.change_dollar||0));
+  const show=moverExpanded?items:items.slice(0,3);
+  document.getElementById('realtime-suffix').textContent=moverExpanded?'(全部 '+items.length+')':'Top 3';
+  const el=document.getElementById('realtime-list');
+  if(!el)return;
+  if(show.length===0){el.innerHTML='<div style="font-size:10px;color:var(--tx3);padding:8px 0">暂无数据 (该时间窗口内未发生显著变化)</div>';return}
+  el.innerHTML=show.map((m,i)=>{
+    const color=m.change_pp>=0?'#00e5a0':'#ff4070';
+    const sign=m.change_pp>=0?'+':'';
+    const title=(m.title||'').replace(/"/g,'&quot;');
+    const primary=metricMode==='dollar'?`${sign}$${Math.abs(m.change_dollar||0).toFixed(2)}`:`${sign}${m.change_pp.toFixed(1)}pp`;
+    return `<div style="padding:8px 0;border-bottom:1px solid rgba(30,30,74,0.4);font-size:11px">
+<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:3px">
+<div style="font-weight:500;color:var(--tx);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35;flex:1" title="${title}">${i+1}. ${title}</div>
+<div style="font-family:'JetBrains Mono';font-weight:700;color:${color};font-size:12px;white-space:nowrap">${primary}</div>
+</div>
+<div style="display:flex;gap:10px;font-family:'JetBrains Mono';font-size:10px;color:var(--tx3);flex-wrap:wrap">
+<span>${m.side}</span>
+<span style="color:${color}">(${sign}${m.change_pct.toFixed(1)}%)</span>
+<span>${(m.first_price*100).toFixed(1)}% → ${(m.last_price*100).toFixed(1)}%</span>
+</div>
+</div>`;
+  }).join('');
+}
+async function loadMovers(range,force){
+  moverRange=range;
+  document.querySelectorAll('.range-btn[data-mrange]').forEach(b=>b.classList.toggle('active',b.dataset.mrange===range));
+  const gEl=document.getElementById('movers-gainers');
+  const lEl=document.getElementById('movers-losers');
+  if(gEl)gEl.innerHTML='<div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div>';
+  if(lEl)lEl.innerHTML='<div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div>';
+  try{
+    const r=await fetch('/api/movers?range='+range+(force?'&force=1':''));
+    const d=await r.json();
+    if(!d.ok)return;
+    lastMovers=d;
+    renderMoversInto(d);
+  }catch(e){console.error('movers load failed',e)}
+}
+async function loadValueRank(force){
+  const el=document.getElementById('value-list');
+  if(el)el.innerHTML='<div style="font-size:10px;color:var(--tx3);padding:8px 0">loading...</div>';
+  try{
+    const r=await fetch('/api/holdings_rank'+(force?'?force=1':''));
+    const d=await r.json();
+    if(!d.ok)return;
+    lastValueRank=d;
+    renderValueInto(d);
+  }catch(e){console.error('value rank load failed',e)}
+}
+function renderMoversInto(d){
+  let gAll,lAll;
+  if(metricMode==='dollar'){
+    const all=[...(d.gainers||[]),...(d.losers||[])];
+    gAll=all.filter(m=>m.change_dollar>0).sort((a,b)=>b.change_dollar-a.change_dollar);
+    lAll=all.filter(m=>m.change_dollar<0).sort((a,b)=>a.change_dollar-b.change_dollar);
+  }else{
+    gAll=d.gainers||[];lAll=d.losers||[];
+  }
+  const gainers=moverExpanded?gAll:gAll.slice(0,3);
+  const losers=moverExpanded?lAll:lAll.slice(0,3);
+  document.getElementById('movers-g-suffix').textContent=moverExpanded?'(全部 '+gAll.length+')':'Top 3';
+  document.getElementById('movers-l-suffix').textContent=moverExpanded?'(全部 '+lAll.length+')':'Top 3';
+  const gEl=document.getElementById('movers-gainers');
+  const lEl=document.getElementById('movers-losers');
+  if(gEl)gEl.innerHTML=renderMoverList(gainers);
+  if(lEl)lEl.innerHTML=renderMoverList(losers);
+}
+function renderValueInto(d){
+  const items=d.items||[];
+  const show=moverExpanded?items:items.slice(0,3);
+  document.getElementById('value-suffix').textContent=moverExpanded?'(全部 '+items.length+')':'Top 3';
+  const el=document.getElementById('value-list');
+  if(!el)return;
+  if(show.length===0){el.innerHTML='<div style="font-size:10px;color:var(--tx3);padding:8px 0">暂无</div>';return}
+  el.innerHTML=show.map((m,i)=>{
+    const pnlColor=m.pnl_dollar>=0?'#00e5a0':'#ff4070';
+    const pnlSign=m.pnl_dollar>=0?'+':'';
+    const title=(m.title||'').replace(/"/g,'&quot;');
+    return `<div style="padding:9px 0;border-bottom:1px solid rgba(30,30,74,0.4);font-size:11px">
+<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:4px">
+<div style="font-weight:500;color:var(--tx);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35;flex:1" title="${title}">${i+1}. ${title}</div>
+<div style="font-family:'JetBrains Mono';font-weight:700;color:#00c8ff;font-size:12px;white-space:nowrap">$${m.value.toFixed(2)}</div>
+</div>
+<div style="display:flex;gap:10px;font-family:'JetBrains Mono';font-size:10px;color:var(--tx3);flex-wrap:wrap">
+<span>${m.side}</span>
+<span>${(m.cur_price*100).toFixed(1)}% × ${m.size.toFixed(1)}股</span>
+<span style="color:${pnlColor}">${pnlSign}$${Math.abs(m.pnl_dollar).toFixed(2)}</span>
+</div>
+</div>`;
+  }).join('');
+}
+function renderMoverList(items){
+  if(!items||items.length===0)return '<div style="font-size:10px;color:var(--tx3);padding:8px 0">暂无</div>';
+  return items.map((m,i)=>{
+    const color=m.change_pp>=0?'#00e5a0':'#ff4070';
+    const sign=m.change_pp>=0?'+':'';
+    const title=(m.title||'').replace(/"/g,'&quot;');
+    const primary=metricMode==='dollar'?`${sign}$${Math.abs(m.change_dollar||0).toFixed(2)}`:`${sign}${m.change_pp.toFixed(1)}pp`;
+    return `<div style="padding:8px 0;border-bottom:1px solid rgba(30,30,74,0.4);font-size:11px">
+<div style="font-weight:500;color:var(--tx);margin-bottom:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35" title="${title}">${i+1}. ${title}</div>
+<div style="display:flex;gap:10px;font-family:'JetBrains Mono';font-size:10px;flex-wrap:wrap">
+<span style="color:${color};font-weight:700">${primary}</span>
+<span style="color:${color}">(${sign}${m.change_pct.toFixed(1)}%)</span>
+<span style="color:var(--tx3)">${(m.first_price*100).toFixed(1)}% → ${(m.last_price*100).toFixed(1)}%</span>
+</div>
+</div>`;
+  }).join('');
+}
+window.addEventListener('load',()=>loadRealtime('1h'));
+setInterval(()=>{if(moverTab==='realtime')loadRealtime(realtimeRange);else if(moverTab==='movers')loadMovers(moverRange);else loadValueRank()},300000);
+
+</script>
+</body>
+</html>
+"""
+
+# === v5.10: 往期仓位监测页面 ===
+# v5.12: 手机只读版 /m. 零交互零写操作, 只复用 3 个现有 API:
+# /api/snapshot (30s) + /api/realtime_movers (30s) + /api/portfolio_history (sparkline).
+# 不加载 chart.js (手画 canvas), 页面 < 15KB. 手机 UA 访问 / 自动 302 过来 (可用 ?desktop=1 退出).
+MOBILE_HTML = r"""
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a0a14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Polymarket · 手机版</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦖</text></svg>">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a14;--sf0:#0f0f1c;--sf:#16162a;--sf2:#1c1c36;--bd:rgba(255,255,255,0.07);--tx:#e8e8ff;--tx2:#9898c8;--tx3:#6868b0;--ac:#00e5a0;--ac2:#00c8ff;--rd:#ff4070;--am:#ffc040;--vi:#8060ff;--acd:rgba(0,229,160,0.10)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;font-size:15px;padding-bottom:env(safe-area-inset-bottom)}
+header{position:sticky;top:0;z-index:50;background:rgba(10,10,20,0.85);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid var(--bd);padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));display:flex;align-items:center;gap:10px}
+.logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#00e5a0,#00c8ff);display:flex;align-items:center;justify-content:center;font-weight:700;color:#060610;font-size:15px;font-family:'JetBrains Mono';flex-shrink:0}
+.htitle{font-size:16px;font-weight:700}
+.htitle span{color:var(--tx3);font-weight:400;font-size:12px;margin-left:6px}
+.live{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:11px;color:var(--ac);font-weight:600}
+.live .dot{width:6px;height:6px;border-radius:50%;background:var(--ac);animation:p 2s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+.lu{font-size:10px;color:var(--tx3);font-family:'JetBrains Mono'}
+.mwrap{padding:14px 14px 30px;max-width:560px;margin:0 auto}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.mc{background:linear-gradient(180deg,var(--sf),var(--sf2));border:1px solid var(--bd);border-radius:14px;padding:14px}
+.mc .k{font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:1.2px;font-weight:600;margin-bottom:6px}
+.mc .v{font-size:22px;font-weight:700;font-family:'JetBrains Mono';letter-spacing:-0.5px}
+.card{background:linear-gradient(180deg,var(--sf),var(--sf2));border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:14px}
+.sp-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.sp-delta{font-size:20px;font-weight:700;font-family:'JetBrains Mono'}
+.sp-sub{font-size:10px;color:var(--tx3);margin-top:2px}
+.rgroup{display:flex;gap:6px}
+.rbtn{padding:6px 14px;border:1px solid var(--bd);background:transparent;color:var(--tx3);border-radius:8px;font-size:13px;font-family:'JetBrains Mono';cursor:pointer}
+.rbtn.active{background:rgba(0,200,255,0.12);border-color:var(--ac2);color:var(--ac2)}
+#spark{display:block;width:100%;height:110px}
+.stitle{font-size:12px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--tx2);margin:18px 2px 10px;display:flex;align-items:center;gap:8px}
+.stitle .cnt{font-size:11px;font-family:'JetBrains Mono';color:var(--tx3);background:var(--sf);padding:2px 9px;border-radius:10px}
+.stitle .rgroup{margin-left:auto}
+.mrow{display:flex;align-items:center;gap:10px;background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:11px 13px;margin-bottom:8px}
+.mrow .t{flex:1;font-size:13px;line-height:1.4;min-width:0}
+.mrow .chg{text-align:right;font-family:'JetBrains Mono';flex-shrink:0}
+.mrow .chg .pp{font-size:16px;font-weight:700}
+.mrow .chg .usd{font-size:10.5px;color:var(--tx3);margin-top:1px}
+.side{display:inline-block;font-size:10px;font-weight:700;padding:1px 7px;border-radius:6px;margin-right:6px;vertical-align:1px}
+.side.yes{background:rgba(0,168,132,0.15);color:#00a884}
+.side.no{background:rgba(204,48,80,0.15);color:#ff6080}
+.pcard{background:var(--sf);border:1px solid var(--bd);border-radius:14px;padding:13px 14px;margin-bottom:10px}
+.pcard .pt{font-size:14px;font-weight:600;line-height:1.45;margin-bottom:8px}
+.pcard .prow{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.pcard .pnlpct{font-size:21px;font-weight:700;font-family:'JetBrains Mono'}
+.pcard .pnlusd{font-size:13px;font-family:'JetBrains Mono';color:var(--tx2)}
+.pcard .meta{margin-top:7px;font-size:11.5px;color:var(--tx3);font-family:'JetBrains Mono';display:flex;gap:12px;flex-wrap:wrap}
+.badge{display:inline-block;font-size:10px;font-weight:600;padding:3px 9px;border-radius:9px;font-family:'JetBrains Mono';letter-spacing:0.3px}
+.b-HOLD{background:rgba(150,150,150,0.15);color:#9aa}
+.b-MARGINAL{background:rgba(255,180,0,0.13);color:#cc9900}
+.b-SOFT_NEGATIVE{background:rgba(140,220,170,0.2);color:#3a8a5a}
+.b-AT_TARGET{background:rgba(0,229,160,0.2);color:#00cf95}
+.b-TIME_STOP{background:rgba(180,80,0,0.16);color:#e08030}
+.b-STOP_LOSS{background:rgba(255,64,112,0.18);color:#ff6080}
+.b-TAKE_PROFIT_PRICE,.b-TAKE_PROFIT_PNL{background:rgba(0,200,140,0.2);color:#00b377}
+.b-PENDING,.b-NO_META{background:rgba(120,120,120,0.1);color:#778}
+.empty{padding:26px;text-align:center;color:var(--tx3);font-size:12px;background:var(--sf);border:1px solid var(--bd);border-radius:12px}
+.up{color:var(--ac)}.down{color:var(--rd)}.flat{color:var(--tx3)}
+footer{text-align:center;padding:22px 0 12px;font-size:12px;color:var(--tx3);line-height:2}
+footer a{color:var(--ac2);text-decoration:none}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">P</div>
+  <div class="htitle">Polymarket <span>手机版</span></div>
+  <div class="live"><div class="dot"></div>监控中</div>
+  <div class="lu" id="lu">…</div>
+</header>
+<div class="mwrap">
+
+<div class="metrics">
+  <div class="mc"><div class="k">总资产</div><div class="v" id="m-assets" style="color:var(--ac2)">—</div></div>
+  <div class="mc"><div class="k">现金</div><div class="v" id="m-cash" style="color:var(--am)">—</div></div>
+  <div class="mc"><div class="k">持仓总盈亏</div><div class="v" id="m-pnl">—</div></div>
+  <div class="mc"><div class="k">持仓数</div><div class="v" id="m-count">—</div></div>
+</div>
+
+<div class="card">
+  <div class="sp-head">
+    <div><div class="sp-delta" id="sp-delta">—</div><div class="sp-sub" id="sp-sub">资产总值变化</div></div>
+    <div class="rgroup">
+      <button class="rbtn active" data-sp="1d" onclick="loadSpark('1d')">1D</button>
+      <button class="rbtn" data-sp="1w" onclick="loadSpark('1w')">1W</button>
+    </div>
+  </div>
+  <canvas id="spark"></canvas>
+</div>
+
+<div class="stitle">⚡ 谁在动
+  <div class="rgroup">
+    <button class="rbtn" data-mv="30m" onclick="loadMovers('30m')">30m</button>
+    <button class="rbtn active" data-mv="1h" onclick="loadMovers('1h')">1h</button>
+  </div>
+</div>
+<div id="movers"><div class="empty">加载中…</div></div>
+
+<div class="stitle">📦 持仓 <span class="cnt" id="pos-n">…</span></div>
+<div id="poslist"><div class="empty">加载中…</div></div>
+
+<div class="stitle">📊 最新往期仓位 <span style="font-size:10px;font-weight:400;color:var(--tx3)">(最近 2 个 · 只看)</span></div>
+<div id="mhist"><div class="empty">加载中…</div></div>
+
+<footer>
+  v{{ ver }} · 只读模式, 操作请去桌面版<br>
+  <a href="/?desktop=1">🖥 切回桌面版</a>
+  {% if force_desktop %} · <a href="/m?auto=1">♻️ 恢复手机自动跳转</a>{% endif %}
+</footer>
+</div>
+
+<script>
+const usd = v => (v==null||isNaN(v)) ? '—' : '$' + Number(v).toFixed(2);
+const sgn = v => (v>=0?'+':'') ;
+function colorOf(v){ return v > 0.001 ? 'var(--ac)' : v < -0.001 ? 'var(--rd)' : 'var(--tx2)'; }
+
+async function loadSnap(){
+  try{
+    const d = await (await fetch('/api/snapshot')).json();
+    if(!d.ok) return;
+    document.getElementById('m-assets').textContent = usd(d.assets_total);
+    document.getElementById('m-cash').textContent = usd(d.cash);
+    const pnlEl = document.getElementById('m-pnl');
+    pnlEl.textContent = (d.total_pnl>=0?'+$':'-$') + Math.abs(d.total_pnl).toFixed(2);
+    pnlEl.style.color = colorOf(d.total_pnl);
+    document.getElementById('m-count').textContent = d.position_count;
+    document.getElementById('pos-n').textContent = d.position_count;
+    const list = document.getElementById('poslist');
+    const rows = d.positions || [];
+    if(!rows.length){ list.innerHTML = '<div class="empty">暂无持仓</div>'; return; }
+    rows.sort((a,b)=>Math.abs(b.pnl_dollar||0)-Math.abs(a.pnl_dollar||0));
+    list.innerHTML = rows.map(p => {
+      const sideCls = (p.side||'').toUpperCase()==='YES' ? 'yes' : 'no';
+      const st = p.monitor_state || 'PENDING';
+      const days = p.days_left != null ? (p.days_left + '天后结算') : '';
+      const qs = p.q != null ? ('q ' + Math.round(p.q*100) + '%') : 'q 未填';
+      return `<div class="pcard">
+        <div class="pt"><span class="side ${sideCls}">${(p.side||'?').toUpperCase()}</span>${days ? '<span style="font-size:10px;font-weight:600;color:var(--tx3);background:rgba(128,128,160,0.12);padding:1px 7px;border-radius:6px;margin-right:6px;vertical-align:1px">'+days+'</span>' : ''}${p.title||p.asset.slice(0,18)}</div>
+        <div class="prow">
+          <span class="pnlpct" style="color:${colorOf(p.pnl_pct)}">${sgn(p.pnl_pct)}${(p.pnl_pct||0).toFixed(1)}%</span>
+          <span class="pnlusd" style="color:${colorOf(p.pnl_dollar)}">${(p.pnl_dollar>=0?'+$':'-$')}${Math.abs(p.pnl_dollar||0).toFixed(2)}</span>
+          <span class="badge b-${st}">${st}</span>
+        </div>
+        <div class="meta">
+          <span>$${(p.avg_price||0).toFixed(3)} → $${(p.cur_price||0).toFixed(3)}</span>
+          <span>现值 ${usd(p.value)}</span>
+          <span>${qs}</span>
+        </div>
+      </div>`;
+    }).join('');
+    document.getElementById('lu').textContent = new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
+  }catch(e){}
+}
+
+let mvRange = '1h';
+async function loadMovers(rng){
+  if(rng) mvRange = rng;
+  document.querySelectorAll('[data-mv]').forEach(b=>b.classList.toggle('active', b.dataset.mv===mvRange));
+  try{
+    const d = await (await fetch('/api/realtime_movers?range='+mvRange)).json();
+    if(!d.ok) return;
+    const box = document.getElementById('movers');
+    const items = d.items || [];
+    if(!items.length){ box.innerHTML = '<div class="empty">暂无数据 (无持仓或拉取中)</div>'; return; }
+    box.innerHTML = items.map(m => {
+      const sideCls = (m.side||'').toUpperCase()==='YES' ? 'yes' : 'no';
+      const arrow = m.change_pp > 0.5 ? '↑' : m.change_pp < -0.5 ? '↓' : '→';
+      return `<div class="mrow">
+        <div class="t"><span class="side ${sideCls}">${(m.side||'?').toUpperCase()}</span>${m.title||''}</div>
+        <div class="chg">
+          <div class="pp" style="color:${colorOf(m.change_pp)}">${arrow} ${sgn(m.change_pp)}${(m.change_pp||0).toFixed(1)}pp</div>
+          <div class="usd">${(m.change_dollar>=0?'+$':'-$')}${Math.abs(m.change_dollar||0).toFixed(2)}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){}
+}
+
+let spRange = '1d';
+async function loadSpark(rng){
+  if(rng) spRange = rng;
+  document.querySelectorAll('[data-sp]').forEach(b=>b.classList.toggle('active', b.dataset.sp===spRange));
+  try{
+    const d = await (await fetch('/api/portfolio_history?range='+spRange)).json();
+    if(!d.ok) return;
+    const pts = (d.points||[]).map(p=>p.assets_total).filter(v=>v!=null);
+    const cv = document.getElementById('spark');
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = cv.clientHeight || 110;
+    cv.width = W*dpr; cv.height = H*dpr;
+    const ctx = cv.getContext('2d'); ctx.scale(dpr,dpr); ctx.clearRect(0,0,W,H);
+    const dEl = document.getElementById('sp-delta'), sEl = document.getElementById('sp-sub');
+    if(pts.length < 2){ dEl.textContent='数据不足'; dEl.style.color='var(--tx3)'; return; }
+    const delta = pts[pts.length-1] - pts[0];
+    dEl.textContent = (delta>=0?'+$':'-$') + Math.abs(delta).toFixed(2);
+    dEl.style.color = colorOf(delta);
+    sEl.textContent = (spRange==='1d'?'过去 24 小时':'过去 7 天') + ' · 现 ' + usd(pts[pts.length-1]);
+    const min = Math.min(...pts), max = Math.max(...pts), pad = (max-min)*0.12 || 1;
+    const x = i => i/(pts.length-1)*(W-4)+2;
+    const y = v => H-6 - (v-(min-pad))/((max+pad)-(min-pad))*(H-12);
+    const up = delta >= 0;
+    const line = up ? '#00e5a0' : '#ff4070';
+    ctx.beginPath();
+    pts.forEach((v,i)=>{ i===0 ? ctx.moveTo(x(i),y(v)) : ctx.lineTo(x(i),y(v)); });
+    ctx.strokeStyle = line; ctx.lineWidth = 2; ctx.lineJoin='round'; ctx.stroke();
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0, up?'rgba(0,229,160,0.22)':'rgba(255,64,112,0.22)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.lineTo(x(pts.length-1),H); ctx.lineTo(x(0),H); ctx.closePath();
+    ctx.fillStyle = g; ctx.fill();
+  }catch(e){}
+}
+
+// v7.x (#17): 最新 2 个往期仓位卡片 (只看, 复用 /api/history/in_progress; 不破 /m 只读)
+async function loadMHist(){
+  try{
+    const d = await (await fetch('/api/history/in_progress')).json();
+    const box = document.getElementById('mhist');
+    if(!box || !d.ok) return;
+    const rows = (d.rows||[]).slice(0,2);
+    if(!rows.length){ box.innerHTML = '<div class="empty">暂无往期仓位</div>'; return; }
+    box.innerHTML = rows.map(r => {
+      const s = (r.sells && r.sells[0]) || {};
+      const held = (String(s.side||'').toUpperCase()==='YES') ? 'YES' : 'NO';
+      const sideCls = held==='YES' ? 'yes' : 'no';
+      const pnl = +s.pnl||0, roi = +s.roi||0, chg = s.change_pp;
+      let vd, vc = 'var(--tx3)';
+      if(chg==null){ vd='⏳ 现价拉取中'; }
+      else if(chg>5){ vd='😬 卖早了 · 卖后又涨 +'+chg.toFixed(1)+'pp'; vc='var(--rd)'; }
+      else if(chg<-5){ vd='👍 卖对了 · 卖后跌 '+chg.toFixed(1)+'pp'; vc='var(--ac)'; }
+      else{ vd='➖ 卖后基本没动'; }
+      return `<div class="pcard">
+        <div class="pt"><span class="side ${sideCls}">${held}</span>${r.title||'—'}</div>
+        <div style="font-size:11px;margin:1px 0 6px;color:${vc}">${vd}</div>
+        <div class="prow">
+          <span class="pnlusd" style="color:${pnl>=0?'var(--ac)':'var(--rd)'}">${pnl>=0?'+$':'-$'}${Math.abs(pnl).toFixed(2)} (${roi>=0?'+':''}${roi.toFixed(0)}%)</span>
+          <span class="badge" style="background:rgba(128,128,160,0.12);color:var(--tx3)">卖${r.sell_count||1}次</span>
+        </div>
+        <div class="meta">
+          <span>$${(+s.entry_avg||0).toFixed(3)} → $${(+s.price||0).toFixed(3)}</span>
+          ${r.cur_price!=null?('<span>现价 $'+(+r.cur_price).toFixed(3)+'</span>'):''}
+          <span>${s.trigger||'—'}</span>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){}
+}
+
+loadSnap(); loadMovers(); loadSpark(); loadMHist();
+setInterval(loadSnap, 30000);
+setInterval(()=>loadMovers(), 30000);
+setInterval(()=>loadSpark(), 300000);
+setInterval(loadMHist, 60000);
+</script>
+</body>
+</html>
+"""
+
+# 独立 /history route. 复用主页 nav + CSS 基础调色板, 加 history-specific 排版.
+HISTORY_HTML = r"""
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Polymarket · 往期仓位监测</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦖</text></svg>">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a14;--sf0:#0f0f1c;--sf:#16162a;--sf2:#1c1c36;--sf3:#23234a;--bd:rgba(255,255,255,0.06);--bd2:rgba(255,255,255,0.10);--tx:#e8e8ff;--tx2:#9898c8;--tx3:#6868b0;--ac:#00e5a0;--ac2:#00c8ff;--rd:#ff4070;--am:#ffc040;--vi:#8060ff;--acd:rgba(0,229,160,0.10);--rdd:rgba(255,64,112,0.10)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;background-image:radial-gradient(ellipse 1400px 700px at 50% -10%,rgba(0,200,255,0.05),transparent 65%),radial-gradient(ellipse 800px 500px at 90% 100%,rgba(128,96,255,0.04),transparent 60%);background-attachment:fixed}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(255,255,255,0.012) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.012) 1px,transparent 1px);background-size:32px 32px;pointer-events:none;z-index:0}
+nav{background:rgba(10,10,20,0.72);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-bottom:1px solid var(--bd);padding:0 28px;height:56px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.nl{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.nr{display:flex;align-items:center;gap:12px}
+.lp{display:flex;align-items:center;gap:5px;padding:4px 12px;background:var(--acd);border:1px solid rgba(0,229,160,0.2);border-radius:20px;font-size:10px;font-weight:600;color:var(--ac)}
+.ld{width:5px;height:5px;border-radius:50%;background:var(--ac);animation:p 2s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+.pages-tab{display:flex;gap:6px;margin-left:20px}
+.ptab{font-size:11px;font-weight:500;padding:6px 12px;background:transparent;color:var(--tx3);border:1px solid var(--bd);border-radius:8px;cursor:pointer;text-decoration:none;transition:all 0.15s;white-space:nowrap}
+.ptab:hover{color:var(--tx);border-color:var(--bd2);background:var(--sf)}
+.ptab-active{background:var(--acd);color:var(--ac);border-color:rgba(0,229,160,0.35);font-weight:600}
+.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#00e5a0,#00c8ff);display:flex;align-items:center;justify-content:center;font-weight:700;color:#060610;font-size:14px;font-family:'JetBrains Mono'}
+.nt{font-size:14px;font-weight:600;margin-left:8px}.nt span{color:var(--tx3);font-weight:400;margin-left:8px;font-size:12px}
+.wrap{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px 20px 60px}
+.section{margin-bottom:36px}
+.section h2{font-size:18px;font-weight:700;color:var(--tx);margin-bottom:10px;display:flex;align-items:center;gap:10px}
+.section h2 .count{font-size:13px;font-weight:500;font-family:'JetBrains Mono';color:var(--tx3);background:var(--sf);padding:3px 10px;border-radius:12px}
+.section .desc{font-size:11px;color:var(--tx3);margin-bottom:14px;line-height:1.5}
+.empty,.loading{padding:30px;text-align:center;color:var(--tx3);font-size:11px;background:var(--sf);border:1px solid var(--bd);border-radius:10px}
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+@media(max-width:900px){.stats-grid{grid-template-columns:repeat(2,1fr)}}
+.stat-card{background:linear-gradient(180deg,var(--sf),var(--sf2));border:1px solid var(--bd);border-radius:12px;padding:16px 18px;position:relative}
+.stat-card h4{font-size:9px;color:var(--tx3);letter-spacing:1.5px;margin-bottom:8px;text-transform:uppercase;font-weight:600}
+.stat-card .num{font-size:24px;font-weight:700;font-family:'JetBrains Mono';letter-spacing:-0.5px;color:var(--tx)}
+.stat-card .num.pos{color:var(--ac)}
+.stat-card .num.neg{color:var(--rd)}
+.stat-card .sub{font-size:10px;color:var(--tx3);margin-top:4px}
+.hist-table{width:100%;border-collapse:collapse;font-size:11px;background:var(--sf);border-radius:10px;overflow:hidden}
+.hist-table th{padding:9px 10px;text-align:left;color:var(--tx3);font-weight:600;border-bottom:1px solid var(--bd);font-size:9.5px;text-transform:uppercase;letter-spacing:1px;background:var(--sf0)}
+.hist-table td{padding:9px 10px;border-bottom:1px solid rgba(255,255,255,0.025);vertical-align:middle;font-size:11px;color:var(--tx)}
+.hist-table tbody tr:hover{background:var(--sf2)}
+.hist-table .mono{font-family:'JetBrains Mono'}
+.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:9.5px;font-weight:600;font-family:'JetBrains Mono'}
+.pill-win{background:var(--acd);color:var(--ac);border:1px solid rgba(0,229,160,0.3)}
+.pill-loss{background:var(--rdd);color:var(--rd);border:1px solid rgba(255,64,112,0.3)}
+.pill-neutral{background:var(--sf2);color:var(--tx3);border:1px solid var(--bd)}
+.scroll-tbl{max-height:520px;overflow-y:auto;border:1px solid var(--bd);border-radius:10px}
+.scroll-tbl .hist-table{border-radius:0}
+.scroll-tbl thead{position:sticky;top:0;z-index:1}
+/* v5.10.1: sell-card 横排样式 (复用主页旧版样式给 /history 用) */
+.cb{max-height:560px;overflow-y:auto;border:1px solid var(--bd);border-radius:10px;background:var(--sf)}
+.lr{padding:12px 18px;border-bottom:1px solid rgba(30,30,74,0.5);font-size:11px;display:grid;grid-template-columns:130px 1fr;gap:14px;align-items:start}
+.lr:hover{background:linear-gradient(90deg,rgba(0,200,255,0.04),transparent 80%)}.lr:last-child{border-bottom:none}
+.lr .lt{font-family:'JetBrains Mono';font-size:11px;color:var(--tx2);font-weight:500}
+.lr .ldd{color:var(--tx);line-height:1.5}
+.ev-title{font-size:12.5px;font-weight:600;color:var(--tx);margin-bottom:5px;line-height:1.4}
+.sell-cards-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:12px;margin-top:10px}
+.sell-card{display:flex;flex-direction:column;gap:8px;padding:14px 17px;background:rgba(0,200,255,0.05);border:1px solid rgba(0,200,255,0.20);border-radius:10px;font-family:'JetBrains Mono';font-size:12.5px;line-height:1.5}
+.sell-card .sc-h{color:var(--tx3);font-size:11.5px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;border-bottom:1px solid rgba(0,200,255,0.15);padding-bottom:6px}
+.sell-card .sc-grid{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:5px 16px;align-items:center}
+@media(max-width:640px){.sell-card .sc-grid{grid-template-columns:auto 1fr}}
+.sell-card .sc-k{color:var(--tx3);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px}
+.sell-card .sc-v{color:var(--tx);font-size:12.5px}
+.sell-card .sc-v .sc-sz{color:#ffc040;font-weight:600}
+.sell-card .sc-v .sc-pr{color:#00c8ff;font-weight:600}
+.sell-card .sc-v .sc-trigger{display:inline-block;padding:1px 7px;background:rgba(255,192,64,0.12);border-radius:4px;font-size:10px;font-weight:600;color:#cc9900}
+.sell-card .sc-f{font-size:13px;font-weight:700;border-top:1px solid var(--bd);padding-top:7px;margin-top:auto}
+.sell-card.resolved-win{background:rgba(0,229,160,0.07);border-color:rgba(0,229,160,0.30)}
+.sell-card.resolved-loss{background:rgba(255,64,112,0.07);border-color:rgba(255,64,112,0.30)}
+.title-cell{max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag-pill{display:inline-block;padding:1px 8px;border-radius:8px;background:rgba(0,200,255,0.10);color:var(--ac2);border:1px solid rgba(0,200,255,0.20);font-size:9.5px;font-weight:500;font-family:'JetBrains Mono'}
+.cluster-pill{display:inline-block;padding:1px 8px;border-radius:8px;background:rgba(128,96,255,0.10);color:var(--vi);border:1px solid rgba(128,96,255,0.20);font-size:9.5px;font-weight:500;font-family:'JetBrains Mono'}
+.tier-pill{font-size:9.5px;padding:1px 6px;border-radius:6px;font-family:'JetBrains Mono'}
+.tier-convergent{background:rgba(255,64,112,0.10);color:var(--rd);border:1px solid rgba(255,64,112,0.20)}
+.tier-hybrid{background:rgba(255,192,64,0.10);color:var(--am);border:1px solid rgba(255,192,64,0.20)}
+.tier-event_driven{background:rgba(128,96,255,0.10);color:var(--vi);border:1px solid rgba(128,96,255,0.20)}
+.kv-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:11px;padding:14px;background:var(--sf);border-radius:10px;border:1px solid var(--bd)}
+.kv-grid .k{color:var(--tx3);font-weight:500}
+.kv-grid .v{color:var(--tx);font-family:'JetBrains Mono'}
+.btn-export{font-size:11px;padding:8px 14px;background:linear-gradient(135deg,#00e5a0,#00c8ff);color:#060610;border:none;border-radius:8px;cursor:pointer;text-decoration:none;font-weight:600;display:inline-block}
+.btn-export:hover{filter:brightness(1.1)}
+.dual-col{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:900px){.dual-col{grid-template-columns:1fr}}
+.dual-col h4{font-size:11px;color:var(--tx2);margin-bottom:8px;font-weight:600}
+/* v5.10.2: 样本不足警示条 + 可折叠区块 + 解读小字 */
+.warn-banner{padding:10px 14px;background:rgba(255,192,64,0.08);border:1px solid rgba(255,192,64,0.25);border-radius:10px;font-size:11px;color:var(--am);margin:14px 0;line-height:1.6}
+details.fold{margin-top:18px;border:1px solid var(--bd);border-radius:10px;background:var(--sf0)}
+details.fold summary{cursor:pointer;padding:11px 14px;font-size:11px;font-weight:600;color:var(--tx2);user-select:none;list-style:none}
+details.fold summary::-webkit-details-marker{display:none}
+details.fold summary::before{content:'▸ ';color:var(--tx3)}
+details.fold[open] summary::before{content:'▾ '}
+details.fold .fold-body{padding:0 14px 14px}
+.note{font-size:10px;color:var(--tx3);margin-top:8px;line-height:1.6}
+footer{text-align:center;padding:20px;font-size:10px;color:var(--tx3)}
+</style>
+</head>
+<body>
+<nav>
+  <div class="nl">
+    <div class="logo">P</div><div class="nt">Polymarket <span>{{ ver }}</span></div>
+    <div class="pages-tab">
+      <a href="/" class="ptab">🏠 主页</a>
+      <a href="/history" class="ptab ptab-active">📊 往期仓位监测</a>
+      <a href="/paper" class="ptab">🧪 测试仓</a>
+      <a href="/m" class="ptab">📱 手机版</a>
+    </div>
+  </div>
+  <div class="nr"><div class="lp"><div class="ld"></div>研究模式</div></div>
+</nav>
+<div class="wrap">
+
+<div class="section" id="section-progress">
+  <h2>🔵 已卖出 · 等待市场结算 <span class="count" id="in-progress-count">…</span></h2>
+  <div class="desc">这些仓位已经卖掉, 盈亏已经锁定; 但市场本身还没出最终结果. 这里跟踪卖出后价格往哪走, 回答一个问题: <b>我们卖早了, 还是卖对了?</b> (卖后又涨 = 卖早了; 卖后下跌 = 卖对了)</div>
+  <div id="in-progress-list" class="loading">加载中...</div>
+</div>
+
+<div class="section" id="section-resolved">
+  <h2>✅ 已结算 · 当初方向赌对了吗 <span class="count" id="resolved-count">…</span></h2>
+  <div class="desc">市场已出最终结果 (我们押的那边兑现成 $1, 或归零). 不管中途卖出价是多少, 这里只看一件事: <b>入场时押的方向对不对</b> — 这是检验判断力的硬指标. 每小时自动检查一轮未结算市场.</div>
+  <div id="resolved-list" class="loading">加载中...</div>
+</div>
+
+<div class="section" id="section-analytics">
+  <h2>📈 统计分析</h2>
+  <div class="desc">先看顶部 4 个总览数字. 下面的分类统计在样本少的时候噪音很大, 当趋势看就好.</div>
+  <div id="analytics-content" class="loading">加载中...</div>
+</div>
+
+<div class="section" id="section-export">
+  <h2>📥 全量数据导出</h2>
+  <div class="desc">全部历史平仓明细 (CSV 含全部字段), 复盘 / 校准研究用. 网页明细表默认收起.</div>
+  <div style="margin-bottom:10px"><a href="/api/history/export?format=csv" class="btn-export">📥 导出 CSV</a></div>
+  <div id="export-table" class="loading">加载中...</div>
+</div>
+
+</div>
+<footer>v7.1 · 往期仓位监测 · last update: <span id="lu"></span></footer>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+<script>
+const fmt = {
+  pct: (v) => v == null ? '—' : (v * 100).toFixed(1) + '%',
+  usd: (v) => v == null ? '—' : '$' + Number(v).toFixed(2),
+  num: (v, d=4) => v == null ? '—' : Number(v).toFixed(d),
+  date: (s) => s ? new Date(s).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—',
+  side: (s) => s ? (s.toUpperCase() === 'YES' ? '买 YES' : '买 NO') : '—',
+};
+
+function tagPill(t){ return t ? '<span class="tag-pill">'+t+'</span>' : '<span class="pill-neutral pill">未标</span>'; }
+function clusterPill(c){ return c ? '<span class="cluster-pill">'+c+'</span>' : '<span class="pill-neutral pill">—</span>'; }
+function tierPill(t){
+  if(!t) return '<span class="pill-neutral pill">legacy</span>';
+  return '<span class="tier-pill tier-'+t+'">'+t+'</span>';
+}
+function correctPill(v){
+  if(v === 1) return '<span class="pill pill-win">✓ 赌赢</span>';
+  if(v === 0) return '<span class="pill pill-loss">✗ 赌输</span>';
+  return '<span class="pill pill-neutral">—</span>';
+}
+function pnlClass(v){ return v >= 0 ? 'pos' : 'neg'; }
+
+// v5.10.1: 渲染一个 sell-card (复用主页 v5.9 旧样式).
+// mode='in_progress' → 用 cur_price 算"卖早/卖对"; mode='resolved' → 用 is_correct 算"赌对/赌错".
+// v5.10.2: verdict 全部改大白话; resolved 加"若持到结算"差额.
+function renderSellCard(s, mode){
+  const heldYes = (s.side === 'Yes' || s.side === 'YES');
+  const held = heldYes ? 'YES' : 'NO';
+  const oppo = heldYes ? 'NO' : 'YES';
+  const chg = s.change_pp;
+  let verdict, vColor = '#888', cardCls = '';
+  if (mode === 'resolved'){
+    // chg = (结算价 - 卖出价) pp; diff = 持有到结算 比 实际卖出 多/少拿多少钱
+    const diff = (chg != null && s.size) ? chg * s.size / 100 : null;
+    let diffStr = '';
+    if (diff != null && Math.abs(diff) >= 0.5){
+      diffStr = diff > 0 ? ` · 若持到结算可多赚 $${diff.toFixed(2)}` : ` · 提前卖避开了 $${Math.abs(diff).toFixed(2)} 损失`;
+    }
+    if (s.is_correct === 1){
+      verdict = `✅ 赌对了 — 押 ${held}, 结果就是 ${held}${diffStr}`;
+      vColor = '#00a884'; cardCls = 'resolved-win';
+    } else if (s.is_correct === 0){
+      verdict = `❌ 赌错了 — 押 ${held}, 结果是 ${oppo}${diffStr}`;
+      vColor = '#b00000'; cardCls = 'resolved-loss';
+    } else {
+      verdict = '⚪ 结算状态未知';
+    }
+  } else {
+    if (chg == null){
+      verdict = '⏳ 现价暂时拉不到, 下轮再看';
+    } else if (chg > 5){
+      verdict = `😬 卖早了 — 卖后又涨 +${chg.toFixed(1)}pp`; vColor = '#b00000';
+    } else if (chg < -5){
+      verdict = `👍 卖对了 — 卖后跌了 ${chg.toFixed(1)}pp`; vColor = '#00a884';
+    } else {
+      verdict = `➖ 卖后基本没动 (${chg >= 0 ? '+' : ''}${chg.toFixed(1)}pp)`;
+    }
+  }
+  const pnl = s.pnl;
+  const roi = s.roi;
+  const pnlColor = pnl == null ? '#888' : (pnl > 0.01 ? '#00a884' : pnl < -0.01 ? '#b00000' : '#888');
+  const pnlStr = pnl == null ? '—' : ((pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2));
+  const roiStr = roi == null ? '' : ' (' + (roi >= 0 ? '+' : '') + roi.toFixed(1) + '%)';
+  return `<div class="sell-card ${cardCls}">
+    <div class="sc-h">第 ${s.seq} 次卖出 · ${s.date}</div>
+    <div class="sc-grid">
+      <div class="sc-k">方向</div><div class="sc-v">${heldYes ? '买 YES' : '买 NO'}</div>
+      <div class="sc-k">卖出</div><div class="sc-v"><span class="sc-sz">${(s.size||0).toFixed(2)} 股</span> @ <span class="sc-pr">$${(s.price||0).toFixed(3)}</span></div>
+      <div class="sc-k">入场</div><div class="sc-v">${s.entry_avg != null ? ('avg <span class="sc-pr">$' + s.entry_avg.toFixed(3) + '</span>') : '—'}</div>
+      ${s.trigger ? `<div class="sc-k">触发</div><div class="sc-v"><span class="sc-trigger">${s.trigger}</span></div>` : ''}
+      <div class="sc-k">收入</div><div class="sc-v">$${(s.revenue||0).toFixed(2)}${s.cost != null ? (' (成本 $' + s.cost.toFixed(2) + ')') : ''}</div>
+      <div class="sc-k">盈亏</div><div class="sc-v" style="color:${pnlColor};font-weight:700">${pnlStr}${roiStr}</div>
+      ${s.duration ? `<div class="sc-k">持仓</div><div class="sc-v" style="color:var(--tx2)">${s.duration}</div>` : ''}
+      ${s.tag ? `<div class="sc-k">tag</div><div class="sc-v">${s.tag}</div>` : ''}
+      ${s.stop_loss_tier ? `<div class="sc-k">tier</div><div class="sc-v">${s.stop_loss_tier}</div>` : ''}
+      ${s.cluster_id ? `<div class="sc-k">cluster</div><div class="sc-v" style="font-size:10px">${s.cluster_id}</div>` : ''}
+    </div>
+    <div class="sc-f" style="color:${vColor}">${verdict}</div>
+  </div>`;
+}
+
+function renderClosedRowList(rows, mode){
+  return rows.map(r => {
+    const cards = r.sells.map(s => renderSellCard(s, mode)).join('');
+    const curStr = r.cur_price != null
+      ? '现价 $' + r.cur_price.toFixed(3) + ' · '
+      : '';
+    return `<div class="lr">
+      <div class="lt">${r.latest_sell_date}</div>
+      <div class="ldd">
+        <div class="ev-title">${r.title || '—'} <span style="color:var(--tx3);font-weight:400;margin-left:6px">${curStr}卖了 ${r.sell_count} 次</span></div>
+        <div class="sell-cards-wrap">${cards}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function loadInProgress(){
+  try {
+    const r = await fetch('/api/history/in_progress');
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.message || 'fetch failed');
+    document.getElementById('in-progress-count').textContent = d.count;
+    const list = document.getElementById('in-progress-list');
+    if (!d.rows.length) { list.innerHTML = '<div class="empty">没有等待结算的仓位 — 全部都已出结果.</div>'; return; }
+    list.innerHTML = '<div class="cb">' + renderClosedRowList(d.rows, 'in_progress') + '</div>';
+  } catch(e) {
+    document.getElementById('in-progress-list').innerHTML = '<div class="empty">⚠ 加载失败: '+e.message+'</div>';
+  }
+}
+
+async function loadResolved(){
+  try {
+    const r = await fetch('/api/history/resolved');
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.message || 'fetch failed');
+    document.getElementById('resolved-count').textContent = d.count;
+    const list = document.getElementById('resolved-list');
+    if (!d.rows.length) { list.innerHTML = '<div class="empty">还没有已结算的仓位 — 结算检查每小时自动跑一次, 等市场出结果就会出现在这里.</div>'; return; }
+    list.innerHTML = '<div class="cb">' + renderClosedRowList(d.rows, 'resolved') + '</div>';
+  } catch(e) {
+    document.getElementById('resolved-list').innerHTML = '<div class="empty">⚠ 加载失败: '+e.message+'</div>';
+  }
+}
+
+async function loadAnalytics(){
+  try {
+    const r = await fetch('/api/history/analytics');
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.message || 'fetch failed');
+    const s = d.summary;
+    const wr = s.win_rate == null ? '—' : (s.win_rate*100).toFixed(0) + '%';
+    const pr = s.profit_rate == null ? '—' : (s.profit_rate*100).toFixed(0) + '%';
+    const hrs = s.avg_hold_hours || 0;
+    const holdStr = hrs >= 48 ? (hrs/24).toFixed(1) + ' 天' : hrs.toFixed(0) + ' 小时';
+    let h = '<div class="stats-grid">';
+    h += '<div class="stat-card"><h4>已平仓笔数</h4><div class="num">'+s.total_closed_count+'</div><div class="sub">'+s.resolved_count+' 已结算 · '+s.unresolved_count+' 等结算 · 平均持仓 '+holdStr+'</div></div>';
+    h += '<div class="stat-card"><h4>累计已实现盈亏</h4><div class="num '+(s.total_realized_pnl_usd>=0?'pos':'neg')+'">'+fmt.usd(s.total_realized_pnl_usd)+'</div><div class="sub">按实际卖出价计, 全部笔数</div></div>';
+    h += '<div class="stat-card"><h4>💰 赚钱率</h4><div class="num '+((s.profit_rate||0)>=0.5?'pos':'neg')+'">'+pr+'</div><div class="sub">'+s.profit_count+'/'+s.total_closed_count+' 笔卖出价高于成本 — 操作主指标, 不等结算</div></div>';
+    h += '<div class="stat-card"><h4>🎯 方向对率</h4><div class="num">'+wr+'</div><div class="sub">'+s.win_count+' 对 / '+s.loss_count+' 错 — 押的方向最终结算对没, 检验判断力</div></div>';
+    h += '</div>';
+    if ((s.resolved_count || 0) < 20){
+      h += '<div class="warn-banner">⚠️ 🎯 方向对率与校准的已结算样本只有 '+s.resolved_count+' 个, 这部分噪音大; 💰 赚钱率基于全部 '+s.total_closed_count+' 笔, 相对可靠. 样本攒够前都别据此猛调策略.</div>';
+    }
+    // v7.x #8: 新分析角度 (时间趋势/盈亏分布 图表 + 卖飞 + 出场方式)
+    const ex = d.extras || {};
+    h += '<div class="dual-col" style="margin-top:22px">';
+    h += '<div><h4>📈 战绩时间趋势 (每月盈亏柱 + 累计线)</h4><div style="height:230px;position:relative;background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:10px"><canvas id="histTrend"></canvas></div></div>';
+    h += '<div><h4>📊 盈亏分布 (每笔多大 · 磨损 vs 大赢)</h4><div style="height:230px;position:relative;background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:10px"><canvas id="histDist"></canvas></div></div>';
+    h += '</div>';
+    const se = ex.sold_early || {}; const net = se.net_usd || 0;
+    h += '<h4 style="margin-top:22px">✈️ 卖飞分析 — 卖了之后市场又走了多远</h4>';
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px">';
+    h += '<div class="stat-card"><h4>卖早了 · 留在桌上</h4><div class="num neg">'+fmt.usd(se.left_on_table_usd||0)+'</div><div class="sub">'+(se.early_count||0)+' 笔本可持到结算多赚</div></div>';
+    h += '<div class="stat-card"><h4>卖得好 · 避开的亏损</h4><div class="num pos">'+fmt.usd(se.saved_usd||0)+'</div><div class="sub">'+(se.good_count||0)+' 笔幸亏没扛到结算</div></div>';
+    h += '<div class="stat-card"><h4>净卖飞代价</h4><div class="num '+(net>0?'neg':'pos')+'">'+(net>0?'-$':'+$')+Math.abs(net).toFixed(2)+'</div><div class="sub">'+(net>0?'整体上卖早了, 少赚这么多':'整体卖得及时/避亏更多')+'</div></div>';
+    h += '</div>';
+    h += '<h4 style="margin-top:22px">🚪 按出场方式 — 哪种卖法赚/亏?</h4>';
+    h += '<table class="hist-table"><thead><tr><th>出场方式</th><th>笔数</th><th>💰赚钱率</th><th>累计盈亏</th></tr></thead><tbody>';
+    (ex.by_exit||[]).forEach(function(er){var prc=er.profit_rate==null?'—':(er.profit_rate*100).toFixed(0)+'%';h+='<tr><td>'+er.reason+'</td><td>'+er.count+'</td><td>'+prc+'</td><td style="color:'+(er.pnl>=0?'var(--ac)':'var(--rd)')+';font-weight:600">'+fmt.usd(er.pnl)+'</td></tr>';});
+    h += '</tbody></table>';
+    h += '<div class="desc" style="margin-top:6px">🟢 止盈类通常最赚, 🔴 重评清仓/止损类多为割肉. 「回填(历史导入)」= 早期从成交记录导入的老仓, 非 bot 决策.</div>';
+    // 赚/亏最多 (具体到单笔, 最直观)
+    h += '<div class="dual-col">';
+    h += '<div><h4>🏆 赚最多的 5 笔</h4>'+renderRankTable(s.top_winners)+'</div>';
+    h += '<div><h4>💀 亏最多的 5 笔</h4>'+renderRankTable(s.top_losers)+'</div>';
+    h += '</div>';
+    // 核心两维: tag + 止损档, 并排省空间
+    h += '<div class="dual-col" style="margin-top:20px">';
+    h += '<div><h4>📊 按题材 — 哪类题材赚得到钱?</h4>' + renderDimTable(d.by_tag, '题材', 'tag') + '</div>';
+    h += '<div><h4>📊 按市场性质 (止损档) — 哪类市场赚得到钱?</h4>' + renderDimTable(d.by_tier, '市场性质', 'tier') + '</div>';
+    h += '</div>';
+    // cluster 维度样本太散, 默认收起
+    h += '<details class="fold"><summary>按 cluster 细分胜率 (样本散, 默认收起)</summary><div class="fold-body">' + renderDimTable(d.by_cluster, 'cluster', 'cluster') + '</div></details>';
+    // calibration
+    h += '<h4 style="margin-top:22px;font-size:11px;color:var(--tx2);font-weight:600">🎯 校准: Claude 入场时估的概率, 和实际对了多少, 差多远?</h4>' + renderCalibration(d.calibration);
+    document.getElementById('analytics-content').innerHTML = h;
+    renderHistCharts(d.extras||{});
+  } catch(e) {
+    document.getElementById('analytics-content').innerHTML = '<div class="empty">⚠ 加载失败: '+e.message+'</div>';
+  }
+}
+
+// v7.x #8: 时间趋势 + 盈亏分布 图表 (每次刷新销毁旧的防泄漏)
+var histTrendChart=null, histDistChart=null;
+function renderHistCharts(ex){
+  if(typeof Chart==='undefined')return;
+  var mon=ex.monthly||[], tc=document.getElementById('histTrend');
+  if(tc){
+    if(histTrendChart)histTrendChart.destroy();
+    histTrendChart=new Chart(tc.getContext('2d'),{
+      data:{labels:mon.map(function(m){return m.month;}),datasets:[
+        {type:'bar',label:'当月盈亏',data:mon.map(function(m){return m.pnl;}),backgroundColor:mon.map(function(m){return m.pnl>=0?'rgba(0,229,160,.55)':'rgba(255,64,112,.55)';}),borderRadius:4,order:2},
+        {type:'line',label:'累计盈亏',data:mon.map(function(m){return m.cum_pnl;}),borderColor:'#00c8ff',backgroundColor:'rgba(0,200,255,.10)',fill:true,tension:0.3,pointRadius:3,borderWidth:2,order:1}
+      ]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#8888c0',font:{size:10},usePointStyle:true,boxWidth:8}},tooltip:{callbacks:{label:function(it){return it.dataset.label+': $'+it.parsed.y.toFixed(2);}}}},scales:{x:{ticks:{color:'#5858a0',font:{size:10}},grid:{display:false}},y:{ticks:{color:'#5858a0',font:{size:10},callback:function(v){return '$'+v;}},grid:{color:'rgba(255,255,255,.04)'}}}}
+    });
+  }
+  var dist=ex.pnl_dist||[], dc=document.getElementById('histDist');
+  if(dc){
+    if(histDistChart)histDistChart.destroy();
+    histDistChart=new Chart(dc.getContext('2d'),{type:'bar',
+      data:{labels:dist.map(function(b){return b.bucket;}),datasets:[{label:'笔数',data:dist.map(function(b){return b.count;}),backgroundColor:['rgba(255,64,112,.75)','rgba(255,64,112,.4)','rgba(0,229,160,.4)','rgba(0,229,160,.75)'],borderRadius:4}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:function(it){return it.parsed.y+' 笔';}}}},scales:{x:{ticks:{color:'#5858a0',font:{size:10}},grid:{display:false}},y:{ticks:{color:'#5858a0',font:{size:10},precision:0},grid:{color:'rgba(255,255,255,.04)'}}}}
+    });
+  }
+}
+
+function renderRankTable(rows){
+  if (!rows || !rows.length) return '<div class="empty">暂无数据</div>';
+  let h = '<table class="hist-table"><thead><tr><th>市场</th><th>方向</th><th>盈亏</th></tr></thead><tbody>';
+  for (const r of rows){
+    h += '<tr><td class="title-cell" title="'+(r.market_slug||'')+'">'+(r.market_slug||'—')+'</td><td>'+fmt.side(r.side)+'</td>'
+      + '<td class="mono '+pnlClass(r.realized_pnl_usd)+'">'+fmt.usd(r.realized_pnl_usd)+' ('+(r.realized_pnl_pct>=0?'+':'')+(r.realized_pnl_pct||0).toFixed(1)+'%)</td></tr>';
+  }
+  return h + '</tbody></table>';
+}
+
+const TIER_NAMES = {convergent: 'convergent · 真相收敛型', hybrid: 'hybrid · 混合型', event_driven: 'event_driven · 事件驱动型'};
+// v5.10.3: 双口径. 💰赚钱率 = 卖出价>成本 (全部笔数, 主指标); 🎯方向对率 = 结算后押对方向 (仅已结算).
+function renderDimTable(rows, label, kind){
+  if (!rows || !rows.length) return '<div class="empty">还没有样本可统计.</div>';
+  let h = '<table class="hist-table"><thead><tr><th>'+label+'</th><th>笔数</th><th>💰 赚钱率</th><th>累计盈亏</th><th>🎯 方向对率</th></tr></thead><tbody>';
+  for (const r of rows){
+    let name = r.dim_value, grey = false;
+    if (name === '(未分类)'){ name = kind === 'tier' ? '(未记录 · 老数据没存这个字段)' : '(未记录)'; grey = true; }
+    else if (kind === 'tier' && TIER_NAMES[name]) name = TIER_NAMES[name];
+    // 样本 <3 时百分比是纯噪音, 只显示 x/y
+    const prPct = (r.count >= 3 && r.profit_rate != null) ? ' ('+(r.profit_rate*100).toFixed(0)+'%)' : '';
+    const prCell = r.profit_count+'/'+r.count+prPct;
+    let wrCell;
+    if (!r.resolved_count){ wrCell = '<span style="color:var(--tx3)">未结算</span>'; }
+    else {
+      const wrPct = (r.resolved_count >= 3 && r.win_rate != null) ? ' ('+(r.win_rate*100).toFixed(0)+'%)' : '';
+      wrCell = r.win_count+'/'+r.resolved_count+wrPct;
+    }
+    h += '<tr'+(grey ? ' style="opacity:0.55"' : '')+'><td>'+name+'</td><td class="mono">'+r.count+'</td><td class="mono">'+prCell+'</td>'
+      + '<td class="mono '+pnlClass(r.total_pnl_usd)+'">'+fmt.usd(r.total_pnl_usd)+'</td><td class="mono">'+wrCell+'</td></tr>';
+  }
+  h += '</tbody></table>';
+  let note = '💰 赚钱率 = 卖出价高于成本的笔数比例, <b>全部笔数都算, 不等结算</b> — 这是"找到 pp 就卖"策略的主指标. '
+    + '🎯 方向对率 = 已结算市场里押对方向的比例 (x/y = 对/已结算笔数), 检验判断力用. 笔数 <3 只给 x/y 不给百分比.';
+  if (kind === 'tag') note += ' 两者可以方向相反: 方向错但提前卖掉照样赚, 方向对但中途止损也会亏.';
+  if (kind === 'tier') note += ' 止损档 = 入场时 Claude 给的市场性质分类 (v5.7 起才有), 老数据没记录、无法补.';
+  h += '<div class="note">'+note+'</div>';
+  return h;
+}
+
+function renderCalibration(rows){
+  const withData = (rows || []).filter(r => r.count > 0);
+  if (!withData.length){
+    return '<div class="empty">还没有可校准的样本 — 需要"已结算 + 入场时记录了 Claude 估计"的仓位, 攒几天数据再来看.</div>';
+  }
+  let h = '<table class="hist-table"><thead><tr><th>Claude 入场估计</th><th>笔数</th><th>赌对</th><th>实际胜率</th><th>偏差</th></tr></thead><tbody>';
+  for (const r of withData){
+    const ar = r.actual_win_rate == null ? '—' : (r.actual_win_rate*100).toFixed(0)+'%';
+    const gap = r.calibration_gap == null ? '—' : ((r.calibration_gap>=0?'+':'')+(r.calibration_gap*100).toFixed(0)+' pp');
+    const gapClass = r.calibration_gap == null ? '' : (r.calibration_gap < 0 ? 'neg' : 'pos');
+    h += '<tr><td>'+r.bucket+'</td><td class="mono">'+r.count+'</td><td class="mono">'+r.win_count+'</td>'
+      + '<td class="mono">'+ar+'</td><td class="mono '+gapClass+'">'+gap+'</td></tr>';
+  }
+  h += '</tbody></table>';
+  h += '<div class="note">怎么读: 比如"70-80%"这行 = Claude 入场时认为有 70-80% 把握的那些仓位, 实际赌对了多少. 偏差为负 = Claude 过度自信 (实际比估的低), 为正 = 偏保守. 没样本的区间不显示.</div>';
+  return h;
+}
+
+async function loadExport(){
+  try {
+    const r = await fetch('/api/history/export?format=json');
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.message || 'fetch failed');
+    const tbl = document.getElementById('export-table');
+    if (!d.rows.length) { tbl.innerHTML = '<div class="empty">尚无历史平仓数据.</div>'; return; }
+    // 关键字段表格 (v5.10.2: 默认收起, 点开才看)
+    const cols = ['exit_at','market_slug','side','avg_entry_price','exit_price','realized_pnl_usd','realized_pnl_pct','exit_reason','stop_loss_tier','tag','cluster_id','is_resolved','final_outcome','is_correct','hold_duration_hours'];
+    let h = '<details class="fold"><summary>展开网页版明细表 ('+d.rows.length+' 行 × '+cols.length+' 列 — 字段名与 CSV 一致)</summary><div class="fold-body">';
+    h += '<div class="scroll-tbl"><table class="hist-table"><thead><tr>';
+    for (const c of cols) h += '<th>'+c+'</th>';
+    h += '</tr></thead><tbody>';
+    for (const r of d.rows){
+      h += '<tr>';
+      for (const c of cols){
+        let v = r[c];
+        if (v == null) v = '—';
+        else if (c === 'exit_at') v = fmt.date(v);
+        else if (c === 'realized_pnl_usd') v = fmt.usd(v);
+        else if (c === 'realized_pnl_pct') v = Number(v).toFixed(2)+'%';
+        else if (c === 'avg_entry_price' || c === 'exit_price' || c === 'final_outcome') v = Number(v).toFixed(3);
+        else if (c === 'hold_duration_hours') v = Number(v).toFixed(1)+'h';
+        h += '<td class="mono">'+v+'</td>';
+      }
+      h += '</tr>';
+    }
+    h += '</tbody></table></div></div></details>';
+    tbl.innerHTML = h;
+  } catch(e) {
+    document.getElementById('export-table').innerHTML = '<div class="empty">⚠ 加载失败: '+e.message+'</div>';
+  }
+}
+
+document.getElementById('lu').textContent = new Date().toLocaleString('zh-CN');
+loadInProgress();
+loadResolved();
+loadAnalytics();
+setInterval(loadAnalytics, 60000);   // v7.x #8: 统计分析每 60s 自动刷新
+loadExport();
+</script>
+</body>
+</html>
+"""
+
+
+# ===== v7.x:「API重评」对比页 — Claude(权威) vs 智谱GLM(参考) 并排; 只这页显示 GLM =====
+API_REEVAL_HTML = r"""<!DOCTYPE html><html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API重评 · Claude vs 智谱</title>
+<style>
+:root{--bg:#0a0a14;--sf:#15151f;--sf2:#1d1d2c;--bd:#2a2a40;--tx:#e8e8f4;--tx2:#a8a8c8;--tx3:#6a6a98;--g:#00e5a0;--r:#ff4070;--c:#00c8ff;--p:#8a6cff;--y:#ffc040}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,'Segoe UI',sans-serif;font-size:13px;-webkit-font-smoothing:antialiased}
+a{color:var(--c);text-decoration:none}a:hover{text-decoration:underline}
+header{padding:14px 20px;border-bottom:1px solid var(--bd);background:var(--sf);position:sticky;top:0;z-index:5}
+header h1{margin:0 0 6px;font-size:17px;background:linear-gradient(90deg,var(--p),var(--c));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.note{color:var(--tx2);font-size:12px;line-height:1.5;max-width:900px}.note b{color:var(--y)}
+.bar{margin-top:8px;display:flex;gap:10px;align-items:center}
+.btn{background:var(--sf2);border:1px solid var(--bd);color:var(--tx);border-radius:10px;padding:6px 14px;cursor:pointer;font-size:12px}.btn:hover{border-color:var(--c)}
+#list{padding:16px 20px;display:flex;flex-direction:column;gap:16px;max-width:1180px;margin:0 auto}
+.rec{background:var(--sf);border:1px solid var(--bd);border-radius:14px;overflow:hidden}
+.rh{padding:12px 16px;border-bottom:1px solid var(--bd);display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.rh .t{font-weight:600;font-size:14px}.rh .sl{color:var(--tx3);font-family:'JetBrains Mono',monospace;font-size:11px}
+.rh .tm{margin-left:auto;color:var(--tx3);font-size:11px}
+.chips{padding:9px 16px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--bd);background:var(--sf2)}
+.chip{font-size:11px;color:var(--tx2);background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:3px 9px}.chip b{color:var(--tx)}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:0}
+.col{padding:12px 16px}.col+.col{border-left:1px solid var(--bd)}
+.cn{font-size:12px;font-weight:700;margin-bottom:8px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.auth{font-size:9px;padding:2px 7px;border-radius:7px;background:rgba(138,108,255,.18);color:var(--p);border:1px solid rgba(138,108,255,.5)}
+.ref{font-size:9px;padding:2px 7px;border-radius:7px;background:rgba(0,200,255,.12);color:var(--c);border:1px solid rgba(0,200,255,.4)}
+.act{display:inline-block;font-size:13px;font-weight:700;padding:3px 10px;border-radius:8px;margin-bottom:6px}
+.a-hold{background:rgba(0,229,160,.15);color:var(--g)}.a-update_q{background:rgba(0,200,255,.15);color:var(--c)}
+.a-exit{background:rgba(255,64,112,.16);color:var(--r)}.a-cancel_autostop{background:rgba(255,192,64,.15);color:var(--y)}
+.kv{font-size:12px;color:var(--tx2);margin:3px 0}.kv b{color:var(--tx)}
+.reason{font-size:12px;color:var(--tx);line-height:1.5;margin:6px 0;white-space:pre-wrap}
+.src{font-size:11px;margin:2px 0;word-break:break-all}
+.err{color:var(--r);font-size:12px}
+details{margin-top:6px}summary{cursor:pointer;color:var(--tx3);font-size:11px}
+pre{white-space:pre-wrap;font-size:11px;color:var(--tx2);background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:8px;max-height:240px;overflow:auto}
+.agree{padding:8px 16px;font-size:12px;border-top:1px solid var(--bd);background:rgba(0,0,0,.2)}
+.ok{color:var(--g)}.diff{color:var(--y)}
+.empty{color:var(--tx3);padding:40px;text-align:center;line-height:1.6}
+.ov{max-width:1180px;margin:16px auto 0;padding:0 20px}
+.ov-panel{background:linear-gradient(135deg,rgba(138,108,255,.10),rgba(0,200,255,.06));border:1px solid var(--bd);border-radius:16px;padding:16px 18px}
+.ov-h{font-size:14px;font-weight:700;margin-bottom:12px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.ov-h span{font-size:11px;color:var(--tx3);font-weight:400}
+.ov-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:12px}
+.ov-card{background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:13px 14px;text-align:center}
+.ov-num{font-size:26px;font-weight:800;font-family:'JetBrains Mono',monospace;line-height:1.1}
+.ov-lbl{font-size:12px;color:var(--tx);font-weight:600;margin-top:5px}
+.ov-sub{font-size:10px;color:var(--tx3);margin-top:2px;line-height:1.3}
+.ov-dist{margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:600px){.ov-dist{grid-template-columns:1fr}}
+.ov-dist .dm{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;font-size:11px}
+.ov-dist .dm b{display:block;margin-bottom:6px;font-size:12px}
+.dbar{display:flex;gap:5px;flex-wrap:wrap}
+.dpill{font-size:10px;padding:2px 8px;border-radius:6px;background:var(--bg);border:1px solid var(--bd);color:var(--tx2)}
+.hb{margin-left:8px;font-size:11px;font-weight:700;padding:3px 10px;border-radius:9px;white-space:nowrap}
+.hb-ok{background:rgba(0,229,160,.16);color:var(--g);border:1px solid rgba(0,229,160,.4)}
+.hb-diff{background:rgba(255,192,64,.16);color:var(--y);border:1px solid rgba(255,192,64,.45)}
+.hb-q{margin-left:6px;font-size:10px;font-weight:600;color:var(--tx3);white-space:nowrap}
+</style></head><body>
+<header>
+<h1>🔬 API重评对比 — Claude (权威) vs 智谱 GLM (参考)</h1>
+<div class="note">每次大跌自动重评, 两个模型<b>同时</b>联网调研。<b>真正驱动自动决策 / 自动卖出的永远是 Claude</b> (只有 Claude 挂了才由智谱顶上)。智谱的输出只在本页给你对比参考 — 主页 / 控制台 / 重评建议区都不显示它。</div>
+<div class="bar"><a href="/">← 返回主页</a><button class="btn" onclick="load()">🔄 刷新</button><span id="stat" style="color:var(--tx3);font-size:11px"></span></div>
+</header>
+<div class="ov" id="overview"></div>
+<div id="list"><div class="empty">加载中…</div></div>
+<script>
+var ACTL={hold:'继续持有',update_q:'更新q·继续持有',exit:'清仓止损',cancel_autostop:'取消自动止损'};
+function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+function pct(x){return (x==null||x==='')?'—':(Math.round(x*1000)/10)+'%'}
+function actBadge(a){a=a||'';return '<span class="act a-'+esc(a)+'">'+(ACTL[a]||a||'—')+'</span>'}
+function modelBox(d,label,isAuth){
+  var h='<div class="cn">'+label+(isAuth?'<span class="auth">权威·驱动自动决策</span>':'<span class="ref">仅对比·不动钱</span>')+'</div>';
+  if(!d){return h+'<div class="err">（本次未跑 / 无数据）</div>'}
+  if(d.error){return h+'<div class="err">⚠️ 失败: '+esc(d.error)+'</div>'+(d.raw_text?('<details><summary>原始输出</summary><pre>'+esc(d.raw_text)+'</pre></details>'):'')}
+  h+=actBadge(d.action);
+  h+='<div class="kv">新 q: <b>'+pct(d.new_q)+'</b> · 信心 <b>'+esc(d.confidence||'—')+'</b> · 论点被推翻 <b>'+(d.thesis_broken?'是':'否')+'</b></div>';
+  if(d.headline_event)h+='<div class="kv">📌 '+esc(d.headline_event)+'</div>';
+  if(d.reason)h+='<div class="reason">'+esc(d.reason)+'</div>';
+  var src=d.sources||[];if(src.length){h+='<div class="kv">来源:</div>';src.slice(0,8).forEach(function(u){h+='<div class="src">🔗 <a href="'+esc(u)+'" target="_blank" rel="noopener">'+esc(u)+'</a></div>'})}
+  if(d.raw_text)h+='<details><summary>原始输出</summary><pre>'+esc(d.raw_text)+'</pre></details>';
+  return h;
+}
+function agree(c,g){
+  if(!c||!g||c.error||g.error)return '';
+  var sameAct=c.action===g.action;
+  var dq=(c.new_q!=null&&g.new_q!=null)?Math.abs(c.new_q-g.new_q):null;
+  var s='<div class="agree">动作: '+(sameAct?'<span class="ok">✓ 一致 ('+(ACTL[c.action]||c.action)+')</span>':'<span class="diff">✗ 不一致 — Claude '+(ACTL[c.action]||c.action)+' / 智谱 '+(ACTL[g.action]||g.action)+'</span>');
+  if(dq!=null)s+=' &nbsp;·&nbsp; q 差: '+(dq<0.05?'<span class="ok">':'<span class="diff">')+(Math.round(dq*1000)/10)+'pp</span>';
+  return s+'</div>';
+}
+function hbadge(c,g){
+  if(!c||!g||c.error||g.error)return '';
+  var same=c.action===g.action;
+  var dq=(c.new_q!=null&&g.new_q!=null)?Math.abs(c.new_q-g.new_q):null;
+  var s='<span class="hb '+(same?'hb-ok':'hb-diff')+'">'+(same?'✓ 两家一致':'✗ 两家不一致')+'</span>';
+  if(dq!=null)s+='<span class="hb-q">q差 '+(Math.round(dq*1000)/10)+'pp</span>';
+  return s;
+}
+function overview(rows){
+  var el=document.getElementById('overview'); if(!el)return;
+  var all=(rows||[]).filter(function(r){return r.compare&&(r.compare.claude||r.compare.glm);});  // 尝试过双评的记录
+  var pairs=[];
+  (rows||[]).forEach(function(r){var cmp=r.compare||{};if(cmp.claude&&cmp.glm&&!cmp.claude.error&&!cmp.glm.error)pairs.push({c:cmp.claude,g:cmp.glm});});
+  var n=pairs.length;
+  if(!n){el.innerHTML='';return;}
+  var same=pairs.filter(function(p){return p.c.action===p.g.action;}).length;
+  var qd=pairs.filter(function(p){return p.c.new_q!=null&&p.g.new_q!=null;}).map(function(p){return Math.abs(p.c.new_q-p.g.new_q);});
+  var avgQ=qd.length?qd.reduce(function(a,b){return a+b;},0)/qd.length:null;
+  var maxQ=qd.length?Math.max.apply(null,qd):null;
+  var thes=pairs.filter(function(p){return !!p.c.thesis_broken===!!p.g.thesis_broken;}).length;
+  function dist(k){var d={hold:0,update_q:0,exit:0,cancel_autostop:0};pairs.forEach(function(p){var a=p[k].action;if(d[a]!=null)d[a]++;});return d;}
+  function pills(d){return ['hold','update_q','exit','cancel_autostop'].filter(function(a){return d[a]>0;}).map(function(a){return '<span class="dpill">'+(ACTL[a]||a)+' <b style="color:var(--tx)">'+d[a]+'</b></span>';}).join('')||'<span class="dpill" style="opacity:.5">无</span>';}
+  var cd=dist('c'),gd=dist('g'),agPct=Math.round(same/n*100),thPct=Math.round(thes/n*100);
+  // #4 追加: 智谱/Claude 失败(挂掉/降级)次数 — 尝试过双评的记录里某方缺失或 error
+  function failed(m){return all.filter(function(r){var x=(r.compare||{})[m];return !x||x.error;}).length;}
+  var glmFail=failed('glm'),claudeFail=failed('claude');
+  // #4 追加: 倾向 (清仓/死守/扛单) 各模型次数 + 谁更多
+  function cnt(k,act){return pairs.filter(function(p){return p[k].action===act;}).length;}
+  var cExit=cnt('c','exit'),gExit=cnt('g','exit'),cHold=cnt('c','hold'),gHold=cnt('g','hold'),cCx=cnt('c','cancel_autostop'),gCx=cnt('g','cancel_autostop');
+  function who(a,b){return a>b?'🟣Claude':b>a?'🔵智谱':'两家一样';}
+  // #4 追加: 平均信心 high=3/medium=2/low=1
+  var CMAP={high:3,medium:2,low:1};
+  function avgConf(k){var xs=pairs.map(function(p){return CMAP[p[k].confidence];}).filter(function(v){return v!=null;});return xs.length?xs.reduce(function(a,b){return a+b;},0)/xs.length:null;}
+  function confLbl(v){return v==null?'—':((v>=2.5?'高':v>=1.5?'中':'低')+' '+(Math.round(v*10)/10));}
+  var cConf=avgConf('c'),gConf=avgConf('g');
+  el.innerHTML='<div class="ov-panel"><div class="ov-h">📊 智谱 vs Claude 总揽 <span>('+n+' 条双方都成功 · 越"一致/差距越小" = 便宜的智谱越能替代 Claude)</span></div>'
+    +'<div class="ov-grid">'
+    +'<div class="ov-card"><div class="ov-num" style="color:'+(agPct>=70?'var(--g)':agPct>=50?'var(--y)':'var(--r)')+'">'+agPct+'%</div><div class="ov-lbl">动作一致率</div><div class="ov-sub">两家选同一决策的比例</div></div>'
+    +'<div class="ov-card"><div class="ov-num" style="color:'+(avgQ!=null&&avgQ<0.08?'var(--g)':'var(--y)')+'">'+(avgQ!=null?(Math.round(avgQ*1000)/10+'pp'):'—')+'</div><div class="ov-lbl">平均 q 差距</div><div class="ov-sub">同一仓 q 估计平均差多少</div></div>'
+    +'<div class="ov-card"><div class="ov-num">'+(maxQ!=null?(Math.round(maxQ*1000)/10+'pp'):'—')+'</div><div class="ov-lbl">最大 q 差距</div><div class="ov-sub">分歧最大的那一次</div></div>'
+    +'<div class="ov-card"><div class="ov-num" style="color:'+(thPct>=70?'var(--g)':'var(--y)')+'">'+thPct+'%</div><div class="ov-lbl">论点判断一致率</div><div class="ov-sub">"是否被推翻"是否同判</div></div>'
+    +'<div class="ov-card"><div class="ov-num" style="color:'+(glmFail>0?'var(--r)':'var(--g)')+'">'+glmFail+'</div><div class="ov-lbl">智谱失败次数</div><div class="ov-sub">智谱跑挂→只能靠Claude'+(claudeFail>0?(' · Claude也挂'+claudeFail+'次'):'')+'</div></div>'
+    +'</div>'
+    +'<div class="ov-dist"><div class="dm"><b>🟣 Claude 动作分布</b><div class="dbar">'+pills(cd)+'</div></div><div class="dm"><b>🔵 智谱 GLM 动作分布</b><div class="dbar">'+pills(gd)+'</div></div></div>'
+    +'<div class="ov-dist"><div class="dm"><b>⚖️ 谁更激进/保守</b><div style="line-height:1.8;color:var(--tx2)">果断清仓 exit: <b style="color:var(--tx)">'+who(cExit,gExit)+'</b> (C'+cExit+'/G'+gExit+')<br>按兵不动 hold: <b style="color:var(--tx)">'+who(gHold,cHold)+'</b> (C'+cHold+'/G'+gHold+')<br>关止损扛单 cancel: <b style="color:var(--tx)">'+who(cCx,gCx)+'</b> (C'+cCx+'/G'+gCx+')</div></div>'
+    +'<div class="dm"><b>🎯 平均信心对比</b><div style="line-height:1.8;color:var(--tx2)">🟣 Claude: <b style="color:var(--tx)">'+confLbl(cConf)+'</b><br>🔵 智谱 GLM: <b style="color:var(--tx)">'+confLbl(gConf)+'</b><br><span style="color:var(--tx3);font-size:10px">高=3 中=2 低=1 · 越高越敢下结论</span></div></div></div>'
+    +'</div>';
+}
+function card(r){
+  var cmp=r.compare||{},c=cmp.claude,g=cmp.glm,authIsClaude=(r.provider!=='glm');
+  var h='<div class="rec"><div class="rh"><span class="t">'+esc(r.title||'(无标题)')+'</span><span class="sl">'+esc(r.slug||'')+'</span><span class="tm">'+esc((r.created_at||'').slice(0,16).replace('T',' '))+' · '+esc(r.status||'')+'</span>'+hbadge(c,g)+'</div>';
+  h+='<div class="chips"><span class="chip">持有 <b>'+esc(r.side||'?')+'</b></span><span class="chip">入场 <b>'+pct(r.avg_price)+'</b></span><span class="chip">触发现价 <b>'+pct(r.cur_price)+'</b></span><span class="chip">亏 <b>'+(r.loss_pct!=null?(Math.round(r.loss_pct*1000)/10+'%'):'—')+'</b></span>';
+  if(r.pre_dump_center!=null)h+='<span class="chip">大跌前中枢 <b>'+pct(r.pre_dump_center)+'</b></span>';
+  if(r.orig_q!=null)h+='<span class="chip">原 q <b>'+pct(r.orig_q)+'</b></span>';
+  h+='</div>';
+  h+='<div class="cols"><div class="col">'+modelBox(c,'🟣 Claude',authIsClaude)+'</div><div class="col">'+modelBox(g,'🔵 智谱 GLM',!authIsClaude)+'</div></div>';
+  h+='</div>';
+  return h;
+}
+async function load(){
+  try{
+    var d=await (await fetch('/api/auto_reeval/compare')).json();
+    var rows=(d&&d.rows)||[];
+    document.getElementById('stat').textContent=rows.length+' 条记录 · 自动 30s 刷新';
+    overview(rows);
+    if(!rows.length){document.getElementById('list').innerHTML='<div class="empty">还没有重评记录。<br>等某个仓位大跌触发自动重评 (或在主页点 🤖 API重评) 后, 这里就会出现 Claude 和智谱的并排对比。</div>';return}
+    document.getElementById('list').innerHTML=rows.map(card).join('');
+  }catch(e){document.getElementById('stat').textContent='加载失败';}
+}
+load();setInterval(load,30000);
+</script></body></html>"""
+
+
+PANEL_HTML = r"""<!DOCTYPE html><html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>总控台</title>
+<style>
+:root{--bg:#0a0a14;--sf:#15151f;--sf2:#1d1d2c;--bd:#2a2a40;--tx:#e8e8f4;--tx2:#a8a8c8;--tx3:#6a6a98;--g:#00e5a0;--r:#ff4070;--c:#00c8ff;--p:#8a6cff;--y:#ffc040}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:radial-gradient(1100px 500px at 85% -15%,rgba(0,200,255,.06),transparent),var(--bg);color:var(--tx);font-family:-apple-system,'Segoe UI',sans-serif;font-size:12px;overflow:hidden;display:flex;flex-direction:column;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
+.top{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--bd);background:var(--sf)}
+.logo{font-size:15px;font-weight:800;background:linear-gradient(90deg,var(--g),var(--c));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.lu{margin-left:auto;font-size:11px;color:var(--tx3);font-family:'JetBrains Mono',monospace}
+.toggle{font-size:14px;font-weight:800;padding:8px 24px;border-radius:22px;border:none;cursor:pointer;letter-spacing:1px;transition:all .15s}
+.toggle.on{background:var(--g);color:#04120c;box-shadow:0 0 16px rgba(0,229,160,.55)}
+.toggle.off{background:var(--r);color:#fff;box-shadow:0 0 16px rgba(255,64,112,.55)}
+.toggle{transition:all .2s ease}
+.ver{font-size:10px;color:var(--tx3);font-family:'JetBrains Mono',monospace;font-weight:600;flex-shrink:0;padding:2px 8px;background:var(--sf2);border:1px solid var(--bd);border-radius:10px;letter-spacing:.3px}
+.dino-track{position:relative;flex:1;height:30px;margin:0 8px;min-width:200px;overflow:hidden;user-select:none;container-type:inline-size}
+.dino-track .ground{position:absolute;bottom:6px;left:0;right:0;height:1px;background:var(--tx3);opacity:.5}
+.dino-track .cactus{position:absolute;bottom:7px;left:0;line-height:1;will-change:transform;animation:cactus-roll 4.5s linear infinite}
+.dino-track .c1{animation-delay:0s;font-size:14px}
+.dino-track .c2{animation-delay:-1.5s;font-size:11px}
+.dino-track .c3{animation-delay:-3s;font-size:13px}
+@keyframes cactus-roll{from{transform:translateX(101cqw)}to{transform:translateX(-24px)}}
+.dino-track .dino{position:absolute;bottom:6px;line-height:1;will-change:transform;animation:dino-jump 4.5s cubic-bezier(0.45,0,0.55,1) infinite}
+.dino-track .d1{left:6px;font-size:17px}
+.dino-track .d2{left:25px;font-size:12px}
+.dino-track .d3{left:40px;font-size:14px}
+@keyframes dino-jump{0%,18%,30%,52%,64%,86%,98%,100%{transform:scaleX(-1) translateY(0)}20%,28%,54%,62%,88%,96%{transform:scaleX(-1) translateY(-14px)}}
+.kpi .v{transition:color .3s ease}
+.lu{transition:opacity .3s ease}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:16px 16px 14px}
+.kpi{background:var(--sf2);border:1px solid var(--bd);border-left:3px solid var(--bd);border-radius:10px;padding:16px 16px}
+.kpi.cy{border-left-color:var(--c)}.kpi.pu{border-left-color:var(--p)}.kpi.gy{border-left-color:var(--tx3)}
+.kpi .l{font-size:12px;color:var(--tx3);margin-bottom:5px}
+.kpi .v{font-size:34px;font-weight:800;font-family:'JetBrains Mono',monospace}
+.main{flex:1;display:flex;flex-direction:column;gap:12px;padding:0 16px 14px;min-height:0}
+.grid2{flex:1;display:grid;grid-template-columns:1.5fr 1fr;gap:12px;min-height:0}
+.side-p .pb{flex:0 0 auto;max-height:185px}
+.hist-p{flex:0 0 auto;border-top:2px solid var(--g)}
+.hist-p .ph{color:var(--g)}
+.histwrap{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px;overflow-y:auto;max-height:230px}
+.hcard{background:var(--sf2);border:1px solid var(--bd);border-radius:8px;padding:9px 11px;min-width:0;overflow:hidden}
+.htitle{font-size:12.5px;font-weight:700;color:var(--tx);margin-bottom:4px;line-height:1.3;word-break:break-word}
+.hverdict{font-size:11px;font-weight:600;margin-bottom:6px}
+.hl{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:2px 0;border-top:1px solid rgba(255,255,255,.04)}
+.hl .hk{color:var(--tx3);flex-shrink:0}
+.hl .hv{color:var(--tx);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;display:flex;flex-direction:column;min-height:0;min-width:0;overflow:hidden}
+.panel.pos-p{border-top:2px solid var(--c)}.panel.todo-p{border-top:2px solid var(--r)}.panel.side-p{border-top:2px solid var(--p)}
+.panel.flash{border-color:var(--r);box-shadow:0 0 14px rgba(255,64,112,.45);animation:fl .8s infinite}
+.ph{display:flex;align-items:center;gap:6px;padding:8px 12px;font-size:12px;font-weight:700;border-bottom:1px solid var(--bd)}
+.pos-p .ph{color:var(--c)}.todo-p .ph{color:var(--r)}.side-p .ph{color:var(--p)}
+.pb{padding:8px 10px;overflow-y:auto;flex:1;min-height:0}
+.pb2{padding:6px 10px;overflow-y:auto;flex:1;min-height:0;border-top:1px solid var(--bd)}
+.subh{font-size:13px;font-weight:700;color:var(--y);padding:8px 12px 3px}
+.prow{display:flex;align-items:center;gap:7px;padding:7px 10px;border-radius:7px;margin-bottom:5px;background:var(--sf2);font-size:13px}
+.side{font-size:10px;font-weight:800;padding:3px 7px;border-radius:5px}
+.side.yes{background:rgba(0,229,160,.16);color:var(--g)}.side.no{background:rgba(255,64,112,.16);color:var(--r)}
+.nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}
+.pval{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--tx2);flex-shrink:0}
+.chg{font-weight:800;font-family:'JetBrains Mono',monospace;font-size:15px}
+.badge{font-size:10px;padding:2px 7px;border-radius:5px;background:rgba(138,108,255,.14);color:var(--tx2)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%}
+.dot.red{background:var(--r);box-shadow:0 0 5px var(--r);animation:fl .9s infinite}
+.dot.yellow{background:var(--y);box-shadow:0 0 5px var(--y);animation:fl .9s infinite}
+@keyframes fl{0%,100%{opacity:1}50%{opacity:.3}}
+.card{background:var(--sf2);border:1px solid var(--bd);border-radius:8px;padding:7px 9px;margin-bottom:5px;font-size:11px}
+.empty{color:var(--tx3);font-size:11px;padding:6px}
+.btn{background:var(--sf2);border:1px solid var(--bd);color:var(--tx2);border-radius:6px;padding:3px 8px;font-size:10px;cursor:pointer}
+.btn:hover{filter:brightness(1.3)}
+.btn-p{background:linear-gradient(135deg,var(--g),var(--c));color:#04120c;border:none;font-weight:700}
+.mini{margin-left:auto}
+.ar-api{background:rgba(138,108,255,.15);color:#a98cff;border:1px solid rgba(138,108,255,.4);border-radius:5px;font-size:10px;padding:0 5px;margin-left:4px;cursor:pointer}
+.ar-api:hover{filter:brightness(1.3)}
+#pop{display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:99;background:#2a0d14;border:2px solid var(--r);border-radius:10px;padding:9px 14px;box-shadow:0 0 18px rgba(255,64,112,.6);animation:fl .8s infinite}
+#pop .t{color:#ff7090;font-weight:800;font-size:13px}
+.dino-btn{background:transparent;border:1px solid var(--g);color:var(--g);font-size:11px;font-weight:700;cursor:pointer;border-radius:6px;padding:3px 10px;transition:all .15s;flex-shrink:0}
+.dino-btn:hover{background:rgba(0,229,160,.14)}
+#dino-modal{display:none;position:fixed;inset:0;z-index:200;background:rgba(5,5,12,.86);align-items:center;justify-content:center}
+.dino-box{background:#f7f7f7;border-radius:12px;overflow:hidden;box-shadow:0 14px 60px rgba(0,0,0,.7);border:1px solid var(--bd)}
+.dino-bar{display:flex;align-items:center;gap:10px;padding:8px 13px;background:var(--sf);color:var(--tx2);font-size:12px;border-bottom:1px solid var(--bd)}
+.dino-bar b{color:var(--g)}
+.dino-bar .x{margin-left:auto;background:var(--r);color:#fff;border:none;border-radius:6px;padding:4px 12px;font-size:12px;font-weight:700;cursor:pointer}
+#dino-frame{display:block;width:640px;height:200px;border:none;background:#f7f7f7}
+.col2{display:flex;flex-direction:column;gap:12px;min-height:0}
+.col2 .panel{flex:1;min-height:0}
+.col2 .pos-p{flex:1.5}
+.col2 .todo-p{flex:0 0 auto}
+.col2 .todo-p .pb{flex:0 1 auto;min-height:48px;max-height:200px}
+.panel.sell-p{border-top:2px solid var(--y)}.sell-p .ph{color:var(--y)}
+.srow{display:flex;align-items:center;gap:8px}
+.srow .slab{font-size:11px;font-weight:800;flex-shrink:0}
+.srow .stm{font-size:10px;color:var(--tx3);font-family:'JetBrains Mono',monospace;flex-shrink:0}
+.sdt{font-size:12px;color:var(--tx2);margin-top:4px;line-height:1.5;word-break:break-word}
+#sells .card{padding:10px 12px;margin-bottom:7px}
+#sells .nm{font-size:14px}
+.acth{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.actc .actt{font-size:12.5px;color:var(--tx);font-weight:600;word-break:break-word;min-width:0}
+.actst{font-size:10px;color:#00e5a0;flex-shrink:0}
+.acta{font-size:11px;color:var(--tx2);flex-shrink:0}
+.actbad{font-size:10px;color:#ff4070;font-weight:700;flex-shrink:0}
+.amore{margin-left:auto;flex-shrink:0;background:transparent;border:1px solid var(--bd);color:var(--c);font-size:10px;cursor:pointer;border-radius:5px;padding:2px 7px}
+.amore:hover{filter:brightness(1.3)}
+.actc .actd{display:none;font-size:11.5px;color:var(--tx2);margin-top:5px;line-height:1.45;border-top:1px solid var(--bd);padding-top:5px;white-space:normal;word-break:break-word}
+#acts .card{padding:8px 10px;margin-bottom:6px;font-size:12px}
+#mv .prow{padding:7px 10px;margin-bottom:5px;font-size:13px}
+#mv .nm{font-size:13px;white-space:normal;word-break:break-word;overflow:visible}#mv .chg{font-size:15px;flex-shrink:0}
+.todo-p .card{font-size:12.5px;padding:9px 11px}
+.todo-p .empty{font-size:12.5px}
+.msg{background:rgba(255,64,112,.10);border:1px solid var(--r);border-radius:8px;padding:8px 10px;margin-bottom:7px;display:flex;align-items:flex-start;gap:8px;animation:fl 1s infinite}
+.msg .ico{flex-shrink:0;font-size:15px;line-height:1.2}
+.msg .mc{flex:1;min-width:0}
+.msg .mt{font-size:13px;font-weight:700;color:#ffb0c2;white-space:normal;word-break:break-word}
+.msg .ms{font-size:11px;color:var(--tx2);margin-top:2px;white-space:normal;word-break:break-word}
+.msg .mok{flex-shrink:0;background:var(--r);color:#fff;border:none;border-radius:6px;padding:5px 11px;font-size:11px;font-weight:700;cursor:pointer}
+.msg .mok:hover{filter:brightness(1.15)}
+.msg.up{background:rgba(0,229,160,.10);border-color:var(--g)}
+.msg.up .mt{color:#8af0c8}
+.msg.up .mok{background:var(--g);color:#04120c}
+</style></head>
+<body>
+<div id="pop"><span class="t" id="pop-t"></span> <button class="btn" onclick="document.getElementById('pop').style.display='none'">知道了</button></div>
+<div id="dino-modal"><div class="dino-box"><div class="dino-bar"><b>🦖 Chrome 小恐龙</b> · 空格/↑ 跳 · ↓ 蹲 · 撞了按空格重来 <button class="x" onclick="dinoClose()">✕ 关闭</button></div><iframe id="dino-frame" title="dino"></iframe></div></div>
+<div class="top">
+<div class="logo">🖥️ 总控台</div>
+<button id="pbtn" class="toggle off" onclick="pTog()">● 离线</button>
+<button id="p-api-btn" class="btn" style="font-size:11px;padding:4px 9px" onclick="pApiToggle()" title="🛑 紧急: 暂停/恢复 所有自动重评 API">🤖 API</button>
+<span class="ver">v7.1</span>
+<div class="dino-track" title="Chrome 离线小恐龙 — 恐龙躲仙人掌"><span class="ground"></span><span class="cactus c1">🌵</span><span class="cactus c2">🌵</span><span class="cactus c3">🌵</span><span class="dino d1">🦖</span><span class="dino d2">🦕</span><span class="dino d3">🦖</span></div>
+<button class="dino-btn" onclick="dinoOpen()" title="点开玩真·Chrome 小恐龙">🦖 来一局</button>
+<span class="lu" id="lu">—</span>
+</div>
+<div class="kpis">
+<div class="kpi cy"><div class="l">总资产</div><div class="v" id="k-assets">—</div></div>
+<div class="kpi pu"><div class="l">现金</div><div class="v" id="k-cash">—</div></div>
+<div class="kpi"><div class="l">持仓盈亏</div><div class="v" id="k-pnl">—</div></div>
+<div class="kpi gy"><div class="l">持仓数</div><div class="v" id="k-cnt">—</div></div>
+</div>
+<div id="p-pres-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:99999;align-items:center;justify-content:center">
+<div style="background:#141a21;border:1px solid #2a323c;border-radius:12px;padding:22px 26px;text-align:center;max-width:300px">
+<div style="font-size:15px;font-weight:700;color:#e6edf3;margin-bottom:8px">你还在吗?</div>
+<div style="font-size:12px;color:#8a97a6;margin-bottom:16px"><span id="p-pres-countdown">60</span> 秒内不点就转为"不在线", 自动 API 会接管</div>
+<button onclick="pStillHere()" style="background:#00b377;color:#fff;border:none;border-radius:7px;padding:7px 16px;font-size:13px;font-weight:700;cursor:pointer">✅ 我在</button>
+</div>
+</div>
+<div class="main">
+<div class="grid2">
+<div class="col2">
+<div class="panel pos-p"><div class="ph">📦 持仓</div><div class="pb" id="pos"></div></div>
+<div class="panel sell-p"><div class="ph">💰 卖出事件</div><div class="pb" id="sells"></div></div>
+</div>
+<div class="col2">
+<div class="panel todo-p" id="todo-panel"><div class="ph">📨 最新消息 <span id="todo-n"></span><button class="btn mini" onclick="msgClrAll()">🔄 全清</button></div><div class="pb"><div id="msg-l"></div><div class="empty" id="todo-e">无</div><div id="todo-l"></div></div></div>
+<div class="panel side-p"><div class="ph">⚡ 谁在动 · 1h</div><div class="pb" id="mv"></div><div class="subh">📜 最近自动动作</div><div class="pb2" id="acts"></div></div>
+</div>
+</div>
+<div class="panel hist-p"><div class="ph">🗂 往期仓位监测 · 最近卖出 2 笔</div><div class="histwrap"><div class="hcard" id="hist0"></div><div class="hcard" id="hist1"></div></div></div>
+</div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function usd(n){n=+n||0;return (n<0?'-$':'$')+Math.abs(n).toFixed(2)}
+function col(n){return (+n||0)>=0?'#00e5a0':'#ff4070'}
+async function post(u,b){try{return await (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})})).json()}catch(e){return {ok:false}}}
+var pOn=false, pAskTimer=null, pLastPing=0, pManualOff=false, pOnlining=false, P_IDLE_MODAL_SEC=600;   // v7.x(#20): 10min 无操作才弹"还在吗"(跟主页同源, 服务器 idle_sec 驱动)
+function pSet(d){
+  pOn=!!(d&&d.effective_online);
+  pManualOff=!!(d&&d.manual_off);   // v5.16: 用户手动下线 → 活动不自动上线
+  var b=document.getElementById('pbtn');if(b){b.className='toggle '+(pOn?'on':'off');b.textContent=pOn?'● 在线':'● 离线'}
+  var idle=d&&d.idle_sec;
+  if(pOn&&idle!=null&&idle>=P_IDLE_MODAL_SEC){pShowAsk()}else{pHideAsk()}
+}
+async function pLoad(){try{pSet(await (await fetch('/api/presence')).json())}catch(e){}}
+async function pApiLoad(){try{var d=await (await fetch('/api/api_paused')).json();pApiRender(d.paused)}catch(e){}}
+function pApiRender(paused){var b=document.getElementById('p-api-btn');if(!b)return;b.dataset.paused=paused?'1':'0';if(paused){b.textContent='🛑 API已暂停';b.style.background='rgba(255,64,112,0.22)';b.style.color='#ff5d7e';b.style.borderColor='rgba(255,64,112,0.65)'}else{b.textContent='🤖 API';b.style.background='';b.style.color='';b.style.borderColor=''}}
+async function pApiToggle(){var b=document.getElementById('p-api-btn');var want=!(b&&b.dataset.paused==='1');if(want){if(!confirm('🛑 紧急暂停所有自动重评 API?\n\n· 自动 + 手动 🤖 + 离线执行 全停\n· 持仓不会盲卖, 冻结在「等重评」(只 $0.05 地板)\n· 再点一下恢复\n\n确认?'))return}else{if(!confirm('▶ 恢复自动重评 API?'))return}var d=await post('/api/api_paused',{paused:want});pApiRender(d&&d.paused)}
+async function pTog(){pSet(await post('/api/presence',{online:!pOn,manual:true}))}
+function pPing(){post('/api/presence/ping',{})}
+function pActivity(){
+  if(pOn){var now=Date.now();if(now-pLastPing>=60000){pLastPing=now;pPing()}return}
+  if(pManualOff||pOnlining)return;
+  pOnlining=true;
+  fetch('/api/presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({online:true,auto:true})}).then(function(r){return r.json()}).then(function(d){if(d&&d.ok){pLastPing=Date.now();pSet(d)}}).catch(function(){}).finally(function(){pOnlining=false})
+}
+function pModalOpen(){var m=document.getElementById('p-pres-modal');return !!(m&&m.style.display==='flex')}
+function pShowAsk(){var m=document.getElementById('p-pres-modal');if(!m||pModalOpen())return;m.style.display='flex';var left=60,cd=document.getElementById('p-pres-countdown');if(cd)cd.textContent=left;clearInterval(pAskTimer);pAskTimer=setInterval(function(){left--;if(cd)cd.textContent=Math.max(0,left);if(left<=0){clearInterval(pAskTimer);pAskTimer=null;pExpire()}},1000)}
+function pHideAsk(){clearInterval(pAskTimer);pAskTimer=null;var m=document.getElementById('p-pres-modal');if(m)m.style.display='none'}
+async function pExpire(){try{var d=await (await fetch('/api/presence')).json();if(d.ok&&d.idle_sec!=null&&d.idle_sec<P_IDLE_MODAL_SEC){pHideAsk();pSet(d);return}}catch(e){}pHideAsk();post('/api/presence',{online:false}).then(pLoad)}
+function pStillHere(){pHideAsk();pLastPing=Date.now();pPing();setTimeout(pLoad,200)}
+['scroll','keydown','click','touchstart'].forEach(function(ev){window.addEventListener(ev,pActivity,{passive:true})});  // v7.x(#20): 去掉 mousemove
+var msgs=[],seen=new Set(),mInit={sells:false,acts:false},baseAssets=null,assetPend=null,actOpen=new Set(),swingState={},mSeq=0,mUid=0,reevalCount=0,reevalFlash=false,pCdMap={};
+function msgIco(k){return k==='sell'?'💰':k==='swing'?'📊':k==='asset'?'💵':k==='act'?'🤖':'🔔'}
+function pushMsg(key,kind,title,sub,dir){if(seen.has(key))return;seen.add(key);msgs.unshift({uid:++mUid,key:key,kind:kind,title:title,sub:sub||'',dir:dir||''});if(msgs.length>30)msgs.length=30;renderMsgs()}
+function msgAck(uid){msgs=msgs.filter(function(m){return m.uid!==uid});renderMsgs()}
+function msgClrAll(){msgs=[];renderMsgs();if(document.querySelectorAll('#todo-l .card').length){clrAll()}}
+function renderMsgs(){var box=document.getElementById('msg-l');if(box){box.innerHTML=msgs.map(function(m){return '<div class="msg'+(m.dir==='up'?' up':'')+'"><span class="ico">'+msgIco(m.kind)+'</span><div class="mc"><div class="mt">'+esc(m.title)+'</div>'+(m.sub?'<div class="ms">'+esc(m.sub)+'</div>':'')+'</div><button class="mok" onclick="msgAck('+m.uid+')">确认</button></div>'}).join('')}
+ var tw=document.getElementById('todo-panel'),tn=document.getElementById('todo-n'),te=document.getElementById('todo-e'),tot=msgs.length+reevalCount;
+ if(tn)tn.textContent=tot?('('+tot+')'):'';
+ if(tw)tw.classList.toggle('flash',msgs.length>0||reevalFlash);
+ if(te)te.style.display=tot===0?'':'none'}
+async function snap(){try{var d=await (await fetch('/api/snapshot')).json();if(!d.ok)return;
+ document.getElementById('k-assets').textContent=usd(d.assets_total);
+ // v6.0.2 修: 防 API 抖动(cash/持仓 偶尔读到 0 或少算一块)误报总资产巨变 —— 忽略非正读数 + 连续两拍都在新水平才提醒
+ var _at=+d.assets_total||0;
+ if(_at>0){
+   if(baseAssets===null){baseAssets=_at;assetPend=null}
+   else if(Math.abs(_at-baseAssets)>=3){
+     if(assetPend!==null&&Math.abs(_at-assetPend)<1){var _df=_at-baseAssets;pushMsg('asset:'+(++mSeq),'asset','总资产 '+(_df>=0?'+':'-')+'$'+Math.abs(_df).toFixed(2),'现 '+usd(_at)+' · 上次提醒 '+usd(baseAssets),(_df>=0?'up':'down'));baseAssets=_at;assetPend=null}
+     else{assetPend=_at}
+   }else{assetPend=null}
+ }
+ document.getElementById('k-cash').textContent=usd(d.cash);
+ var pe=document.getElementById('k-pnl');pe.textContent=usd(d.total_pnl);pe.style.color=col(d.total_pnl);
+ document.getElementById('k-cnt').textContent=d.position_count;
+ var rows=(d.positions||[]).slice().sort(function(a,b){return Math.abs(b.pnl_dollar||0)-Math.abs(a.pnl_dollar||0)});
+ document.getElementById('pos').innerHTML=rows.map(function(p){
+   var sc=(p.side||'').toUpperCase()==='YES'?'yes':'no';
+   var days=p.days_left!=null?p.days_left+'天':'';
+   var stop=p.autostop_disabled?' <span class="badge" style="color:#ff4070">🛑OFF</span>':'';
+   var lt=window.__lit&&window.__lit[p.asset];
+   var dot=lt?' <span class="dot '+lt+'"></span>':'';
+   var ms=p.monitor_state||'';var msb=ms==='PENDING_REEVAL'?'<span class="badge" style="background:rgba(255,160,0,.18);color:#ffb020">⏸等重评</span>':(ms?'<span class="badge">'+esc(ms)+'</span>':'');
+   var cdb=pCdBadge(p.asset);
+   return '<div class="prow"><span class="side '+sc+'">'+(p.side||'?').toUpperCase()+'</span><span class="nm">'+esc(p.title||p.asset)+'</span>'+dot+'<span class="pval">'+usd(p.value)+'</span><span style="color:'+col(p.pnl_pct)+';font-weight:600">'+(p.pnl_pct>=0?'+':'')+(p.pnl_pct||0).toFixed(0)+'%</span>'+msb+cdb+'<span class="badge">'+days+'</span>'+stop+'<button class="ar-api" onclick="arApi(\''+p.asset+'\')" title="用 API 联网重评">🤖</button></div>';
+ }).join('')||'<div class="empty">暂无持仓</div>';
+}catch(e){}}
+function actL(r){return r.action==='exit'?'清仓':r.action==='update_q'?('q→'+Math.round((r.new_q||0)*100)+'%'):r.action==='cancel_autostop'?'取消止损':'持有'}
+// v6.0.2: 默认(未展开)就显示做了什么; update_q 显示 原q → 新q
+function actLed(r){if(r.action==='update_q'){var o=(r.orig_q!=null)?Math.round(r.orig_q*100)+'%':'?';return 'q '+o+' → '+Math.round((r.new_q||0)*100)+'%'}return actL(r)}
+function pCard(r){
+ var n=esc(r.title||r.slug||r.token_id);
+ if(r.status==='analyzing')return '<div class="card">🔬 '+n+' 调研中… <button class="btn" onclick="arClr('+r.id+')">清空</button></div>';
+ if(r.status==='manual')return '<div class="card">📋 '+n+' (在线·自动暂停) <button class="btn btn-p" onclick="cpPrompt(\''+r.token_id+'\')">复制提示词</button> <button class="btn" onclick="arClr('+r.id+')">清空</button></div>';
+ if(r.status==='error')return '<div class="card">⚠️ '+n+' 调研失败 <button class="btn" onclick="arClr('+r.id+')">清空</button></div>';
+ return '<div class="card"><b>'+n+'</b> · '+actL(r)+(r.thesis_broken?' ⚠️论点破':'')+'<div style="font-size:10px;color:var(--tx2);margin:3px 0">'+esc(r.reason||'')+'</div><button class="btn btn-p" onclick="arOk('+r.id+')">✅确认</button> <button class="btn" onclick="arNo('+r.id+')">忽略</button> <button class="btn" onclick="arClr('+r.id+')">清空</button></div>';
+}
+var seenU=null;
+async function pend(){try{var d=await (await fetch('/api/auto_reeval/pending')).json();if(!d.ok)return;var rows=d.rows||[];
+ var lit={},sn={};rows.forEach(function(r){if(sn[r.token_id])return;sn[r.token_id]=1;lit[r.token_id]=(r.status==='pending'||r.status==='manual')?'red':'yellow'});window.__lit=lit;
+ var todo=rows.filter(function(r){return ['analyzing','pending','manual','error'].indexOf(r.status)>=0});
+ var acts=rows.filter(function(r){return r.status==='executed'});
+ acts.forEach(function(r){var k='act:'+r.id;if(!mInit.acts){seen.add(k);return}pushMsg(k,'act',(r.title||r.slug||'')+' 自动'+actL(r),r.reason||'')});mInit.acts=true;
+ document.getElementById('todo-l').innerHTML=todo.map(pCard).join('');
+ reevalCount=todo.length;reevalFlash=todo.some(function(r){return r.status==='pending'||r.status==='manual'});
+ document.getElementById('acts').innerHTML=acts.slice(0,8).map(function(r){var op=actOpen.has(r.id);var rsn=esc(r.reason||'');var tb=r.thesis_broken?' <span class="actbad">⚠️论点破</span>':'';var det=rsn?'<div id="actd-'+r.id+'" class="actd" style="display:'+(op?'block':'none')+'">'+rsn+'</div>':'';var more=rsn?'<button class="amore" id="actm-'+r.id+'" onclick="actToggle('+r.id+')">'+(op?'收起 ▴':'更多 ▾')+'</button>':'';return '<div class="card actc"><div class="acth"><span class="actt">'+esc(r.title||r.slug)+'</span><span class="actst">✓已执行</span><span class="acta">'+actLed(r)+'</span>'+tb+more+'</div>'+det+'</div>'}).join('')||'<div class="empty">无</div>';
+ renderMsgs();
+ var uids=todo.filter(function(r){return r.status==='pending'||r.status==='manual'}).map(function(r){return r.id});
+ if(seenU===null)seenU=new Set(uids);
+ else{var fr=uids.filter(function(i){return !seenU.has(i)});if(fr.length){var p=document.getElementById('pop'),t=document.getElementById('pop-t');t.textContent='⚠️ 紧急: '+uids.length+' 个待处理';p.style.display='block'}uids.forEach(function(i){seenU.add(i)})}
+}catch(e){}}
+function pfCd(ms){var s=Math.floor(ms/1000);var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?(h+'h'+(m<10?'0':'')+m+'m'):(m>0?m+'m':'<1m')}
+function pCdBadge(tok){var c=pCdMap[tok];if(!c)return '';if(c.state==='cooling'){var rem=(c.end_ms||0)-Date.now();if(rem<=0)return '';return ' <span class="badge" style="background:rgba(94,200,255,.16);color:#5ec8ff" title="自动重评冷却中, 还剩这么久才会再自动评">❄️'+pfCd(rem)+'</span>'}return ''}
+async function pCool(){try{var d=await (await fetch('/api/auto_reeval/history')).json();if(!d.ok)return;var m={};(d.rows||[]).forEach(function(r){if(r.cd_state==='cooling'&&!m[r.token_id])m[r.token_id]={state:'cooling',end_ms:r.cd_end_ms}});pCdMap=m}catch(e){}}
+async function arOk(id){if(!confirm('确认执行? (exit 会真卖)'))return;await post('/api/auto_reeval/confirm',{id:id});pend();snap()}
+async function arNo(id){await post('/api/auto_reeval/dismiss',{id:id});pend()}
+async function arClr(id){await post('/api/auto_reeval/clear',{id:id});pend()}
+async function clrAll(){if(!confirm('全部清空清单? (是否再自动评由 6h 冷却控制)'))return;await post('/api/auto_reeval/clear_all',{});pend()}
+async function arApi(t){if(!confirm('用 API 联网重评这个仓位? 会花一次钱。\n结果等你手动确认才执行 (不管在不在线都不自动卖)。'))return;var d=await post('/api/auto_reeval/trigger',{token_id:t});alert(d&&d.ok?'🤖 已触发, 0.5-2 分钟后出结果':'触发失败: '+((d&&d.message)||''));pend()}
+function cpPrompt(t){fetch('/api/reeval_prompt?token_id='+t).then(function(r){return r.json()}).then(function(d){var tx=d.prompt||d.message||'';if(navigator.clipboard)navigator.clipboard.writeText(tx);alert('提示词已复制 (也打印在 console)');console.log(tx)})}
+async function mov(){try{var d=await (await fetch('/api/realtime_movers?range=1h')).json();var items=(d.items||[]).slice().sort(function(a,b){return Math.abs(b.change_pp||0)-Math.abs(a.change_pp||0)}).slice(0,5);
+ (d.items||[]).forEach(function(x){var v=+x.change_pp||0,a=x.asset;if(Math.abs(v)>=10){var bk='swing:'+a+':'+(v>=0?'u':'d')+':'+Math.floor(Math.abs(v)/10);if(swingState[a]!==bk){swingState[a]=bk;pushMsg(bk,'swing',(x.title||a)+' 1h '+(v>=0?'▲':'▼')+Math.abs(v).toFixed(1)+'pp','现价 $'+(+x.last_price||0).toFixed(3),(v>=0?'up':'down'))}}else if(Math.abs(v)<7){if(swingState[a]){Array.from(seen).forEach(function(k){if(k.indexOf('swing:'+a+':')===0)seen.delete(k)});swingState[a]=null}}});
+ document.getElementById('mv').innerHTML=items.map(function(x){var v=+x.change_pp||0;return '<div class="prow"><span class="nm">'+esc(x.title||x.asset)+'</span><span class="chg" style="color:'+(v>=0?'var(--g)':'var(--r)')+'">'+(v>=0?'▲':'▼')+' '+Math.abs(v).toFixed(1)+'pp</span></div>'}).join('')||'<div class="empty">—</div>';
+}catch(e){}}
+async function sells(){try{var d=await (await fetch('/api/system_events?limit=4')).json();var box=document.getElementById('sells');if(!box)return;
+ if(d.ok){(d.items||[]).forEach(function(e){var k='sell:'+(e.kind||'')+':'+(e.title||'')+':'+(e.time||'');if(!mInit.sells){seen.add(k);return}pushMsg(k,'sell',(e.label||'卖出')+': '+(e.title||''),'去「卖出事件」看详情')});mInit.sells=true}
+ if(!d.ok||!d.items||!d.items.length){box.innerHTML='<div class="empty">暂无卖出</div>';return}
+ box.innerHTML=d.items.map(function(e){var lc=e.kind==='auto_sell'?'var(--g)':'var(--c)';return '<div class="card"><div class="srow"><span class="slab" style="color:'+lc+'">'+esc(e.label)+'</span><span class="nm">'+esc(e.title)+'</span><span class="stm">'+esc(e.time)+'</span></div><div class="sdt">'+esc(e.detail)+'</div></div>'}).join('');
+}catch(e){}}
+function actToggle(id){if(actOpen.has(id))actOpen.delete(id);else actOpen.add(id);var op=actOpen.has(id);var e=document.getElementById('actd-'+id);if(e)e.style.display=op?'block':'none';var b=document.getElementById('actm-'+id);if(b)b.textContent=op?'收起 ▴':'更多 ▾'}
+function histRow(k,v,c){return '<div class="hl"><span class="hk">'+k+'</span><span class="hv"'+(c?' style="color:'+c+'"':'')+'>'+v+'</span></div>'}
+function histCard(r){var s=(r.sells&&r.sells[0])||{};var held=(s.side==='Yes'||s.side==='YES')?'YES':'NO';var pnl=+s.pnl||0,roi=+s.roi||0,cp=r.cur_price,chg=s.change_pp;var vd,vc='var(--tx3)';
+ if(chg==null){vd='⏳ 现价拉取中, 下轮再看'}else if(chg>5){vd='😬 卖早了 — 卖后又涨 +'+chg.toFixed(1)+'pp';vc='var(--r)'}else if(chg<-5){vd='👍 卖对了 — 卖后跌 '+chg.toFixed(1)+'pp';vc='var(--g)'}else{vd='➖ 卖后基本没动 ('+(chg>=0?'+':'')+chg.toFixed(1)+'pp)'}
+ var h='<div class="htitle">'+esc(r.title||'—')+'</div><div class="hverdict" style="color:'+vc+'">'+esc(vd)+'</div>';
+ h+=histRow('方向','<span class="side '+(held==='YES'?'yes':'no')+'">'+held+'</span>');
+ h+=histRow('成本→卖出','$'+(+s.entry_avg||0).toFixed(3)+' → $'+(+s.price||0).toFixed(3));
+ if(cp!=null)h+=histRow('现价','$'+(+cp).toFixed(3));
+ h+=histRow('盈亏',(pnl>=0?'+':'')+'$'+pnl.toFixed(2)+' ('+(roi>=0?'+':'')+roi.toFixed(0)+'%)',pnl>=0?'var(--g)':'var(--r)');
+ h+=histRow('卖出原因',esc(s.trigger||'—'));
+ h+=histRow('止损档',esc(s.stop_loss_tier||'—'));
+ h+=histRow('tag / 簇',esc(s.tag||'—')+(s.cluster_id?' · '+esc(s.cluster_id):''));
+ h+=histRow('持仓 / 次数',esc(s.duration||'—')+' · 卖'+(r.sell_count||1)+'次');
+ return h}
+function hist(){fetch('/api/history/in_progress').then(function(r){return r.json()}).then(function(d){if(!d.ok)return;var rows=(d.rows||[]).slice(0,2);for(var i=0;i<2;i++){var el=document.getElementById('hist'+i);if(!el)continue;if(!rows[i]){el.innerHTML='<div class="empty">—</div>';continue}el.innerHTML=histCard(rows[i])}}).catch(function(){})}
+function dinoOpen(){var m=document.getElementById('dino-modal'),f=document.getElementById('dino-frame');if(f&&!f.src)f.src='/dino/';if(m)m.style.display='flex';setTimeout(function(){try{f.contentWindow.focus()}catch(e){}},150)}
+function dinoClose(){var m=document.getElementById('dino-modal');if(m)m.style.display='none'}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')dinoClose()});
+function clk(){var e=document.getElementById('lu');if(e)e.textContent=new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+function tick(){pend();snap();sells();clk();pApiLoad()}
+post('/api/presence',{arm:true}).then(function(d){if(d&&d.ok)pSet(d)});   // v5.16: 新会话解除"手动下线"抑制 → 活动可自动上线
+pLoad();tick();mov();hist();pCool();
+setInterval(tick,15000);setInterval(mov,30000);setInterval(pLoad,15000);setInterval(hist,60000);setInterval(clk,1000);setInterval(pCool,30000);
+</script></body></html>"""
+
+
+PAPER_HTML = r"""<!DOCTYPE html><html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🧪 测试仓 (模拟盘)</title>
+<style>
+:root{--bg:#0a0a14;--sf0:#0f0f1c;--sf:#16162a;--sf2:#1c1c36;--sf3:#23234a;--bd:rgba(255,255,255,0.06);--bd2:rgba(255,255,255,0.10);--tx:#e8e8ff;--tx2:#9898c8;--tx3:#6868b0;--ac:#00e5a0;--ac2:#00c8ff;--rd:#ff4070;--am:#ffc040;--vi:#8060ff;--acd:rgba(0,229,160,0.10);--rdd:rgba(255,64,112,0.10);--card:#16162a;--g:#00e5a0;--r:#ff4070;--y:#ffc040;--bg2:#0f0f1c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,system-ui,sans-serif;font-size:13px}
+a{color:var(--ac)}
+.top{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:var(--bg);z-index:5;flex-wrap:wrap}
+.top h1{font-size:15px;margin:0}
+.btn{background:#1d2533;color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer}
+.btn:hover{border-color:var(--ac)}
+.btn-p{background:var(--ac);color:#001018;font-weight:700;border:none}
+.btn-r{background:rgba(255,64,112,.15);color:var(--r);border-color:var(--r)}
+.wrap{padding:14px 16px;max-width:1100px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin-bottom:12px}
+.sl{font-size:12px;color:var(--tx2);margin:14px 0 6px;font-weight:600;overflow:hidden}
+input,select,textarea{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;font-size:12px;font-family:inherit}
+.frm{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.frm label{font-size:11px;color:var(--tx3);display:flex;flex-direction:column;gap:2px}
+.prow{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.side{font-size:10px;font-weight:800;padding:3px 7px;border-radius:5px}
+.side.yes{background:rgba(0,229,160,.16);color:var(--g)}.side.no{background:rgba(255,64,112,.16);color:var(--r)}
+.nm{flex:1;min-width:160px;font-size:13px}
+.nm a{color:var(--tx);text-decoration:none}.nm a:hover{color:var(--ac)}
+.mono{font-family:'JetBrains Mono',monospace;font-size:12px}
+.badge{font-size:10px;padding:2px 7px;border-radius:5px;background:rgba(138,108,255,.14);color:var(--tx2)}
+.ws{font-size:11px;color:var(--y);margin-top:3px;width:100%}
+.empty{color:var(--tx3);padding:16px;text-align:center}
+.sum{font-size:13px;color:var(--tx2)}
+.note{font-size:11px;color:var(--tx3);margin-top:4px}
+/* v7.1.2: 测试仓持仓行 = 抄主页主持仓显示, 一模一样 (列/颜色/决策状态行) */
+@keyframes reevalPulse{0%,100%{opacity:1}50%{opacity:0.55}}
+.pos-hdr,.pos-row{padding:10px 18px;border-bottom:1px solid var(--bd);display:grid;grid-template-columns:minmax(180px,2.5fr) 40px 52px 55px 55px 45px 65px 55px 70px 240px;gap:5px;align-items:center;font-size:11px}
+.pos-hdr{font-weight:700;color:var(--tx3);font-size:10px;background:var(--sf2)}
+.pos-row .nm{font-weight:500;white-space:normal;word-break:break-word;line-height:1.35;padding-right:6px;flex:none;min-width:0;font-size:11px}
+.pos-row .nm a{color:var(--tx);text-decoration:none}.pos-row .nm a:hover{color:var(--ac2)}
+.pos-row .mono{font-family:'JetBrains Mono',monospace;font-size:11px}
+.q-cell{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.tp-input{width:46px;padding:3px 6px;font-size:10px;height:24px;text-align:center;border:1px solid var(--bd);border-radius:5px;background:var(--bg);color:var(--ac2);font-family:'JetBrains Mono'}
+.q-pct{font-size:10px;color:var(--tx3)}
+.q-tag{font-size:9px;padding:2px 5px;border-radius:4px;background:var(--sf0);color:var(--tx2);border:1px solid var(--bd)}
+.monitor-state-row{padding:6px 14px;display:flex;align-items:center;gap:6px;background:rgba(0,168,132,0.04);border-left:3px solid var(--ac);margin:6px 0 12px 18px;border-radius:4px;flex-wrap:wrap}
+.ms-label{font-size:10px;color:var(--tx3);font-weight:600}
+.ms-badge{font-family:'JetBrains Mono';font-size:11px;padding:3px 9px;border-radius:11px;font-weight:600;letter-spacing:0.3px}
+.ms-HOLD{background:rgba(150,150,150,0.15);color:#888}
+.ms-MARGINAL{background:rgba(255,180,0,0.12);color:#cc9900}
+.ms-SOFT_NEGATIVE{background:rgba(140,220,170,0.22);color:#3a8a5a}
+.ms-AT_TARGET{background:rgba(0,229,160,0.2);color:#00a884;animation:reevalPulse 2s ease-in-out infinite}
+.ms-PENDING_REEVAL{background:rgba(255,160,0,0.18);color:#e08800;animation:reevalPulse 1.5s ease-in-out infinite}
+.ms-TIME_STOP{background:rgba(180,80,0,0.15);color:#b05000}
+.ms-STOP_LOSS{background:rgba(180,0,0,0.22);color:#d04040;font-weight:600}
+.ms-TAKE_PROFIT_PRICE,.ms-TAKE_PROFIT_PNL{background:rgba(0,200,140,0.25);color:#00b070;font-weight:600}
+.ms-PENDING,.ms-NO_META{background:rgba(120,120,120,0.10);color:#999}
+.ws{font-size:11px;color:var(--am);margin:1px 0 8px 18px}
+</style></head><body>
+<div class="top"><h1>🧪 测试仓 · 模拟盘</h1><a href="/" class="btn">🏠 主页</a><span class="sum" id="sum"></span><span style="margin-left:auto;font-size:11px;color:var(--tx3)">不真下单 · 实时盯盘 · 跟真仓同一套算法</span></div>
+<div class="wrap">
+
+<div class="sl">➕ 手动录入测试仓</div>
+<div class="card">
+<div class="frm">
+<label>市场 slug<input id="f-slug" style="width:300px" placeholder="will-..."></label>
+<label>方向<select id="f-side"><option>No</option><option>Yes</option></select></label>
+<label>入场价(0-1)<input id="f-entry" type="number" step="0.001" style="width:90px" placeholder="0.54"></label>
+<label>金额$<input id="f-usd" type="number" step="1" style="width:80px" placeholder="10"></label>
+<label>q(可选)<input id="f-q" type="number" step="0.01" style="width:80px" placeholder="0.86"></label>
+<label>止损档<select id="f-tier"><option value="">(legacy)</option><option value="convergent">convergent</option><option value="hybrid">hybrid</option><option value="event_driven">event_driven</option></select></label>
+<button class="btn btn-p" onclick="addManual()">➕ 录入</button>
+</div>
+<div class="note">入场价 = 你"假装"在这个价买入(持有 token 的价, 0-1)。token / 标题 / 结算日 会按 slug+方向 自动从 Polymarket 查。</div>
+<div id="add-msg" class="note"></div>
+</div>
+
+<div class="sl">📋 从 Claude JSON 一键录入 (粘贴 DISCOVERY 的 json 块)</div>
+<div class="card">
+<textarea id="j-raw" style="width:100%;height:78px" placeholder='[{"slug":"...","side":"No","cur_price":0.54,"q":0.86,"stop_loss_tier":"convergent","end_date":"2026-06-30"}]'></textarea>
+<div class="frm" style="margin-top:8px">
+<label title="金额默认按主页同一套公式自动算; 这个只是公式算不出/不建议时的兜底值">兜底$<input id="j-usd" type="number" step="1" value="10" style="width:80px"></label>
+<button class="btn btn-p" onclick="addJson()">📋 全部录入测试仓</button>
+<span id="j-msg" class="note"></span>
+</div>
+<div class="note">入场价用 JSON 里的 cur_price (推荐当时的价); 金额按主页同一套公式自动算 (公式不建议时才用兜底$)。</div>
+</div>
+
+<div class="sl">🧪 测试仓 · 进行中 (<span id="cnt">0</span>) <button class="btn btn-r" style="float:right" onclick="clearAll()">🗑 全部清空</button></div>
+<div class="card" style="padding:0;overflow:hidden"><div id="list"><div class="empty">加载中…</div></div></div>
+
+<div class="sl">📊 测试仓统计 <span style="font-size:11px;color:var(--tx3);font-weight:400">(验证 Claude 推荐 + 这套自动出场算法到底准不准 · 全是模拟)</span></div>
+<div id="paper-stats" class="card" style="padding:14px 16px"><div class="empty">加载中…</div></div>
+
+<div class="sl">📜 往期测试仓 <span id="hcnt" style="font-size:11px;color:var(--tx3);font-weight:400">(已卖/清空/结算 · 预测准不准 + 最高点)</span></div>
+<div class="card" style="padding:0;overflow:hidden"><div id="paper-history"><div class="empty">加载中…</div></div></div>
+
+</div>
+<script>
+function usd(n){n=+n||0;return (n<0?'-$':'$')+Math.abs(n).toFixed(2)}
+function col(n){return (+n||0)>=0?'#00e5a0':'#ff4070'}
+function esc(s){return String(s==null?'':s).replace(/[&<>\"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json()}
+async function addManual(){
+  var b={slug:document.getElementById('f-slug').value.trim(),side:document.getElementById('f-side').value,
+    entry_price:parseFloat(document.getElementById('f-entry').value),size_usd:parseFloat(document.getElementById('f-usd').value),
+    q:parseFloat(document.getElementById('f-q').value)||null,stop_loss_tier:document.getElementById('f-tier').value||null};
+  var m=document.getElementById('add-msg');
+  if(!b.slug||!(b.entry_price>0)||!(b.size_usd>0)){m.textContent='⚠️ slug / 入场价 / 金额 必填';return}
+  m.textContent='录入中 (查 Polymarket)…';
+  var d=await post('/api/paper/add',b);
+  m.textContent=d.ok?('✓ 已录入: '+esc(d.title||b.slug)):('✗ '+esc(d.message||'失败'));
+  if(d.ok){document.getElementById('f-slug').value='';document.getElementById('f-entry').value='';load()}
+}
+async function addJson(){
+  var m=document.getElementById('j-msg');var raw=document.getElementById('j-raw').value;var fb=parseFloat(document.getElementById('j-usd').value)||10;
+  var arr;try{var mt=raw.match(/\[[\s\S]*\]/);arr=JSON.parse(mt?mt[0]:raw)}catch(e){m.textContent='✗ JSON 解析失败';return}
+  if(!Array.isArray(arr))arr=[arr];
+  m.textContent='录入中 (金额按公式自动算)…';var ok=0,fail=0,sizes=[];
+  for(var i=0;i<arr.length;i++){var r=arr[i];
+    var d=await post('/api/paper/add',{slug:r.slug,side:r.side,entry_price:r.cur_price,auto_size:true,fallback_usd:fb,q:r.q,
+      confidence:r.confidence,stop_loss_tier:r.stop_loss_tier,cluster_id:r.cluster_id,tag:r.tag,end_date:r.end_date,days_to_resolution:r.days_to_resolution,notes:r.reason});
+    if(d.ok){ok++;if(d.size_usd!=null)sizes.push('$'+d.size_usd)}else{fail++}}
+  m.textContent='✓ 录入 '+ok+' 条'+(sizes.length?(' (公式金额 '+sizes.join(' / ')+')'):'')+(fail?(' · 失败 '+fail+' (slug 对吗/是否已结算)'):'');load()
+}
+async function copyReeval(id){
+  var d;try{d=await (await fetch('/api/paper/reeval_prompt?id='+id)).json()}catch(e){alert('网络错误');return}
+  if(!d.ok){alert('生成失败: '+(d.message||''));return}
+  try{await navigator.clipboard.writeText(d.prompt);alert('✓ 重评提示词已复制 (免费, 没调任何API)。贴去 Claude.ai, 读到新 q 后填到这条的 q→ 框里点「存q」。')}
+  catch(e){var t=document.createElement('textarea');t.value=d.prompt;document.body.appendChild(t);t.select();try{document.execCommand('copy');alert('✓ 已复制 (兼容模式)')}catch(e2){alert('复制失败, 请手动选取')}document.body.removeChild(t)}
+}
+async function saveQ(id){
+  var pct=parseFloat(document.getElementById('q-'+id).value);
+  if(!(pct>0&&pct<100)){alert('q 要在 1-99 之间 (整数 %, 跟主页一样)');return}
+  var d=await post('/api/paper/update_q',{id:id,q:pct/100});
+  if(d.ok){load()}else{alert('存失败: '+(d.message||''))}
+}
+function tierShort(t){return t==='convergent'?'收敛':t==='hybrid'?'混合':t==='event_driven'?'事件':(t||'—')}
+async function clearOne(id){if(!confirm('清空这条测试仓?'))return;await post('/api/paper/clear',{id:id});load()}
+async function clearAll(){if(!confirm('清空所有测试仓? (数据归档不删, 只是不再盯)'))return;await post('/api/paper/clear_all',{});load()}
+function stBadge(s){if(!s)return '';var c='var(--tx2)';if(s==='HOLD')c='#00e5a0';else if(s==='PENDING_REEVAL')c='#ffb020';else if(s.indexOf('STOP')>=0||s==='SOFT_NEGATIVE'||s==='AT_TARGET')c='#ff4070';else if(s.indexOf('TAKE_PROFIT')>=0)c='#00e5a0';return '<span class="badge" style="color:'+c+'">'+esc(s)+'</span>'}
+async function load(){
+  var d;try{d=await (await fetch('/api/paper/list')).json()}catch(e){return}
+  if(!d.ok)return;var rows=d.rows||[];
+  document.getElementById('cnt').textContent=rows.length;
+  document.getElementById('sum').textContent=rows.length?('模拟合计 '+usd(d.total_pnl)+' · '+rows.length+' 仓'):'';
+  var L=document.getElementById('list');
+  if(!rows.length){L.innerHTML='<div class="empty">还没有测试仓。上面录入 Claude 推荐试试 (尤其那些看着很离谱的)。</div>';return}
+  var hdr='<div class="pos-hdr"><span>名称</span><span>方向</span><span>距结算</span><span>入场价</span><span>当前价</span><span>份数</span><span>当前价值</span><span>盈亏%</span><span>盈亏$</span><span>q + 信心 + 止损</span></div>';
+  L.innerHTML=hdr+rows.map(function(p){
+    var SIDE=(p.side||'?').toUpperCase();
+    var sideColor=SIDE==='YES'?'#00a884':'#cc3050';
+    var entry=+p.entry_price||0, cur=(p.cur_price!=null?+p.cur_price:entry), shares=+p.shares||0;
+    var pnlu=+p.pnl_usd||0, pnlp=+p.pnl_pct||0, pnlc=pnlu>=0?'#00e5a0':'#ff4070';
+    var value=entry*shares+pnlu;
+    var qv=(p.q!=null?+p.q:null);
+    var days=(p.days_left!=null&&!p.is_resolved)?(p.days_left+'天'):'—';
+    var resolved=p.is_resolved?(' <span class="badge" style="color:'+(p.final_outcome>=0.5?'#00e5a0':'#ff4070')+'">'+(p.final_outcome>=0.5?'✅结算赢':'❌结算输')+'</span>'):'';
+    var st=p.monitor_state||'PENDING';
+    var edge=(qv!=null)?('q='+(qv*100).toFixed(1)+'% &nbsp;|&nbsp; p='+(cur*100).toFixed(1)+'% &nbsp;|&nbsp; edge='+((qv-cur)*100).toFixed(1)+'pp'):'';
+    var ws=p.would_sell_at_ts?('<div class="ws">⚠️ 算法本会在 $'+(+p.would_sell_price).toFixed(3)+' 卖 ('+esc(p.would_sell_reason||'')+') · 那时模拟盈亏 '+usd(p.would_sell_pnl_usd)+' · 但仍继续盯到结算</div>'):'';
+    return '<div class="pwrap">'
+      +'<div class="pos-row">'
+        +'<span class="nm"><a href="https://polymarket.com/event/'+esc(p.market_slug||'')+'" target="_blank">'+esc(p.title||p.market_slug||p.token_id)+'</a>'+resolved+'</span>'
+        +'<span class="mono" style="color:'+sideColor+';font-weight:600">'+SIDE+'</span>'
+        +'<span class="mono" style="color:var(--tx3)" title="距结算">'+days+'</span>'
+        +'<span class="mono" style="color:#8060ff" title="入场价">$'+entry.toFixed(3)+'</span>'
+        +'<span class="mono" style="color:#00c8ff" title="当前价">$'+cur.toFixed(3)+'</span>'
+        +'<span class="mono" style="color:#ffc040" title="份数">'+shares.toFixed(1)+'</span>'
+        +'<span class="mono" style="color:'+pnlc+'" title="当前价值 (模拟)">$'+value.toFixed(2)+'</span>'
+        +'<span class="mono" style="color:'+pnlc+'">'+(pnlp>=0?'+':'')+pnlp.toFixed(1)+'%</span>'
+        +'<span class="mono" style="color:'+pnlc+'">'+(pnlu>=0?'+$':'-$')+Math.abs(pnlu).toFixed(2)+'</span>'
+        +'<div class="q-cell">'
+          +'<input class="tp-input" id="q-'+p.id+'" type="number" step="1" min="1" max="99" value="'+(qv!=null?Math.round(qv*100):'')+'" placeholder="q%" title="录入时 JSON 里的 q (已带进来); 手动重评后想改就改这里点存q"><span class="q-pct">%</span>'
+          +'<span class="q-tag" title="信心">'+esc(p.confidence||'—')+'</span>'
+          +'<span class="q-tag" title="止损档">'+tierShort(p.stop_loss_tier)+'</span>'
+          +'<button class="btn" style="padding:3px 7px;font-size:10px" onclick="saveQ('+p.id+')">存q</button>'
+        +'</div>'
+      +'</div>'
+      +'<div class="monitor-state-row">'
+        +'<span class="ms-label">决策状态:</span>'
+        +'<span class="ms-badge ms-'+st+'">'+st+'</span>'
+        +'<span class="ms-meta" style="font-size:10px;color:var(--tx3);margin-left:8px">'+edge+'</span>'
+        +'<span style="margin-left:auto;display:flex;gap:6px">'
+          +'<button class="btn" style="padding:3px 8px;font-size:10px" onclick="copyReeval('+p.id+')" title="生成手动重评提示词(免费, 不调API), 复制去 Claude.ai">📋 重评</button>'
+          +'<button class="btn btn-r" style="padding:3px 8px;font-size:10px" onclick="clearOne('+p.id+')" title="清空这条测试仓">🗑</button>'
+        +'</span>'
+      +'</div>'
+      +ws
+    +'</div>'
+  }).join('')
+}
+// v7.x #16: 往期测试仓 + 统计
+function statCard(lbl,num,color,sub){
+  return '<div style="background:var(--sf);border:1px solid var(--bd);border-radius:12px;padding:12px 14px;text-align:center"><div style="font-size:22px;font-weight:800;font-family:monospace;color:'+color+'">'+num+'</div><div style="font-size:12px;color:var(--tx);font-weight:600;margin-top:4px">'+lbl+'</div><div style="font-size:10px;color:var(--tx3);margin-top:2px">'+sub+'</div></div>';
+}
+function verdictHtml(p){
+  var parts=[], peak=+p.peak_price||0, entry=+p.entry_price||0, peakPnl=+p.peak_pnl_usd||0;
+  if(p.hist_kind==='resolved'){
+    var win=(p.final_outcome>=0.5);
+    parts.push('<b style="color:'+(win?'#00e5a0':'#ff4070')+'">'+(win?'✅ 押对了 (结算兑现)':'❌ 押错了 (结算没兑现)')+'</b>');
+  }
+  if(p.would_sell_at_ts){
+    var wp=+p.would_sell_pnl_usd||0;
+    parts.push('🤖 算法在 $'+(+p.would_sell_price).toFixed(3)+' 卖 · 模拟'+(wp>=0?'赚 +$':'亏 -$')+Math.abs(wp).toFixed(2)+(p.would_sell_reason?(' ('+esc(p.would_sell_reason)+')'):''));
+  }
+  if(peak>entry+0.001) parts.push('📈 最高 $'+peak.toFixed(3)+' (本可赚 +$'+peakPnl.toFixed(2)+')');
+  return parts.join(' &nbsp;·&nbsp; ')||'—';
+}
+async function loadHistory(){
+  var d;try{d=await (await fetch('/api/paper/history')).json()}catch(e){return}
+  if(!d.ok)return;var rows=d.rows||[],s=d.stats||{};
+  var wr=s.win_rate==null?'—':(s.win_rate*100).toFixed(0)+'%';
+  var pr=s.profit_rate==null?'—':(s.profit_rate*100).toFixed(0)+'%';
+  var tp=+s.total_pnl_usd||0;
+  document.getElementById('paper-stats').innerHTML=
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px">'
+    +statCard('模拟总盈亏',(tp>=0?'+$':'-$')+Math.abs(tp).toFixed(2),tp>=0?'#00e5a0':'#ff4070',s.count+' 笔历史')
+    +statCard('💰 模拟赚钱率',pr,(s.profit_rate||0)>=0.5?'#00e5a0':'#ff4070',(s.profit_count||0)+'/'+(s.count||0)+' 笔赚')
+    +statCard('🎯 结算对率',wr,'#00c8ff',(s.win_count||0)+'/'+(s.resolved_count||0)+' 已结算押对')
+    +'</div><div style="font-size:11px;color:var(--tx3);margin-top:9px">全是<b>模拟</b> (从没真下单)。赚钱率=模拟卖出价高于成本的比例; 结算对率=押的方向最终兑现没。样本少时噪音大, 攒够再看。</div>';
+  document.getElementById('hcnt').textContent='('+rows.length+' 笔 · 已卖/清空/结算)';
+  var H=document.getElementById('paper-history');
+  if(!rows.length){H.innerHTML='<div class="empty">还没有往期测试仓。测试仓被算法"卖" / 清空 / 结算后, 会带着"预测准不准 + 最高点"归到这里。</div>';return}
+  var GC='grid-template-columns:minmax(150px,2fr) 42px 78px 116px 104px minmax(190px,2.6fr);gap:8px';
+  var hdr='<div style="display:grid;'+GC+';align-items:center;padding:9px 16px;font-size:10px;font-weight:700;color:var(--tx3);background:var(--sf2);border-bottom:1px solid var(--bd)"><span>名称</span><span>方向</span><span>类型</span><span>入场→最终</span><span>模拟盈亏</span><span>判定 (准不准 + 最高点)</span></div>';
+  H.innerHTML=hdr+rows.map(function(p){
+    var SIDE=(p.side||'?').toUpperCase(),sc=SIDE==='YES'?'#00a884':'#cc3050';
+    var entry=+p.entry_price||0;
+    var fpr=(p.is_resolved&&p.final_outcome!=null)?+p.final_outcome:(p.would_sell_at_ts?+p.would_sell_price:(p.cur_price!=null?+p.cur_price:entry));
+    var fp=+p.final_pnl_usd||0,fpp=+p.final_pnl_pct||0,fc=fp>=0?'#00e5a0':'#ff4070';
+    var kb=p.hist_kind==='resolved'?'<span class="badge" style="color:#00c8ff">已结算</span>':p.hist_kind==='sold'?'<span class="badge" style="color:#ffb020">算法已卖</span>':'<span class="badge" style="color:var(--tx3)">已清空</span>';
+    return '<div style="display:grid;'+GC+';align-items:center;padding:11px 16px;border-bottom:1px solid var(--bd);font-size:12px">'
+      +'<span style="font-weight:500;line-height:1.3;word-break:break-word">'+esc(p.title||p.market_slug||p.token_id)+'</span>'
+      +'<span style="color:'+sc+';font-weight:700;font-family:monospace">'+SIDE+'</span>'
+      +'<span>'+kb+'</span>'
+      +'<span style="font-family:monospace;font-size:11px;color:var(--tx2)">$'+entry.toFixed(3)+'→$'+fpr.toFixed(3)+'</span>'
+      +'<span style="font-family:monospace;font-weight:700;color:'+fc+'">'+(fp>=0?'+$':'-$')+Math.abs(fp).toFixed(2)+' <span style="font-size:10px;font-weight:400">'+(fpp>=0?'+':'')+fpp.toFixed(0)+'%</span></span>'
+      +'<span style="font-size:11px;line-height:1.55">'+verdictHtml(p)+'</span>'
+      +'</div>';
+  }).join('')
+}
+load();loadHistory();setInterval(function(){load();loadHistory();},15000);
+</script></body></html>"""
+
+
+def create_app():
+    app = Flask(__name__)
+    app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_urlsafe(32)
+    app.config.update(
+        PERMANENT_SESSION_LIFETIME=timedelta(days=90),
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=True,
+    )
+
+    @app.before_request
+    def _require_auth():
+        # v5.9 (2026-06-01): 改用 Host 头判断本机, 比 X-Forwarded-For 更可靠.
+        # - 本机直连 (浏览器地址栏 http://localhost:5051 或 127.0.0.1:5051) → Host 头 = localhost/127.0.0.1
+        # - Tailscale serve 反代 → Host 头 = *.tailXXXX.ts.net (Tailscale serve 保留真实 Host)
+        # Host 头由浏览器地址栏决定, 浏览器扩展 / 代理插件改不了 — 比 XFF 头稳.
+        # 历史教训:
+        #   v5.7 用 (remote_addr==127.0.0.1 + 无 XFF) — 浏览器扩展乱注入 XFF 会误拦本机
+        #   v5.9 用 Host 头 — 100% 可靠区分"浏览器直访 localhost" vs "经 Tailscale 反代"
+        host = (flask_request.host or "").lower().split(":")[0]
+        is_local_direct = host in ("localhost", "127.0.0.1", "::1")
+        if is_local_direct:
+            return None
+        # 已登录 → 直通
+        if session.get("authed"):
+            return None
+        # 登录/静态路径 → 直通
+        if flask_request.path in ("/login", "/favicon.ico"):
+            return None
+        # POST 类返回 401 JSON (避免 fetch 被静默重定向)
+        if flask_request.method == "POST":
+            return jsonify({"ok": False, "error": "auth required"}), 401
+        # GET → 跳登录页
+        return redirect("/login")
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login_route():
+        ip = flask_request.remote_addr or "unknown"
+        if flask_request.method == "POST":
+            if not _rate_check(ip):
+                log.warning(f"login lockout: ip={ip}")
+                return render_template_string(LOGIN_HTML, error="尝试次数过多, 30 分钟后再试"), 429
+            pw = flask_request.form.get("password", "")
+            expected = os.environ.get("DASHBOARD_PASSWORD", "")
+            if expected and pw == expected:
+                session["authed"] = True
+                session.permanent = True
+                _rate_clear(ip)  # v5.7 (P11): db-backed clear
+                log.info(f"login ok: ip={ip}")
+                return redirect("/")
+            _rate_fail(ip)
+            # v5.7 (P11): use db to read counter for log message
+            from modules.db import get_login_attempt
+            _rec = get_login_attempt(ip)
+            _attempts = _rec.get("fail_count", 0) if _rec else 0
+            log.warning(f"login fail: ip={ip} attempts={_attempts}")
+            return render_template_string(LOGIN_HTML, error="密码错误"), 401
+        return render_template_string(LOGIN_HTML, error=None)
+
+    @app.route("/logout", methods=["POST"])
+    def logout_route():
+        session.clear()
+        return redirect("/login")
+
+    @app.route("/")
+    def index():
+        from modules.db import get_position_meta
+        # v4: 不再计算触发价, monitor_state 由 monitor 心跳写入数据库
+        # dashboard 直接读 meta.monitor_state 显示徽章
+        from datetime import datetime, timezone
+
+        # v5.12: 手机 UA 自动跳手机版 /m. ?desktop=1 = 用户主动切桌面 (cookie 记 90 天不再跳).
+        # iPad 视为桌面 (现代 iPadOS UA 报 Mac, 正好落桌面分支).
+        import re as _re
+        ua = flask_request.headers.get("User-Agent", "")
+        is_mobile = bool(_re.search(r"iPhone|Android.*Mobile|Windows Phone", ua))
+        _want_desktop_cookie = flask_request.args.get("desktop") == "1"
+        if is_mobile and not _want_desktop_cookie and flask_request.cookies.get("force_desktop") != "1":
+            return redirect("/m")
+
+        init_db()
+        exe = Executor.get()
+        positions = exe.get_positions_cached()   # v7.1 提速: 首屏用心跳缓存, 避免页面加载等 data-api(timeout 30s)
+        
+        # v4.1: 补充 slug + end_date (Executor 不返回这两个字段)
+        from modules.db import needs_reeval
+        import requests as _req
+        for p in positions:
+            meta = get_position_meta(p["asset"])
+            p["meta"] = meta or {}
+            p["current_tp"] = (meta.get("new_tp") if meta and meta.get("new_tp") else (meta.get("tp") if meta else None))
+            p["needs_reeval"] = needs_reeval(p["asset"], hours=24) if meta else False
+            
+            # 优先用 meta 里存的 (一旦保存过就不再调 API)
+            p["market_slug"] = (meta.get("market_slug") if meta else "") or ""
+            p["end_date"] = (meta.get("end_date") if meta else "") or ""
+            
+            # 如果 meta 里没有, 调 Gamma API 反查 (按 token id)
+            if not p["market_slug"] or not p["end_date"]:
+                try:
+                    r = _req.get("https://gamma-api.polymarket.com/markets",
+                                 params={"clob_token_ids": p["asset"], "limit": 1},
+                                 timeout=8).json()
+                    if r and isinstance(r, list) and len(r) > 0:
+                        m = r[0]
+                        if not p["market_slug"]:
+                            p["market_slug"] = m.get("slug", "") or ""
+                        if not p["end_date"]:
+                            p["end_date"] = m.get("endDate", "") or ""
+                except Exception:
+                    pass
+        
+            # v5.12+: 距结算天数 (桌面持仓行 距结算 列显示, 跟 /m 的 days_left 口径一致)
+            p["days_left"] = None
+            if p["end_date"]:
+                try:
+                    from datetime import datetime, timezone
+                    _ed = datetime.fromisoformat(p["end_date"].replace("Z", "+00:00"))
+                    if _ed.tzinfo is None: _ed = _ed.replace(tzinfo=timezone.utc)  # naive 当 UTC, 防减法崩
+                    p["days_left"] = (_ed - datetime.now(timezone.utc)).days
+                except Exception:
+                    pass
+
+        # v7.x: 持仓详情按下单日期 (meta.created_at) 新→旧排序 (无日期的排最后; sorted 生成新列表, 不动缓存顺序)
+        from modules.db import _parse_iso_to_aware as _piso
+        from datetime import datetime as _dtx, timezone as _tzx
+        positions = sorted(positions, key=lambda _p: (_piso((_p.get("meta") or {}).get("created_at")) or _dtx.min.replace(tzinfo=_tzx.utc)), reverse=True)
+        events = get_recent_events(100)
+        total_pnl = sum((p["cur_price"]-p["avg_price"])*p["size"] for p in positions)
+        total_cost = sum(p["avg_price"]*p["size"] for p in positions)
+        total_value = sum(p["cur_price"]*p["size"] for p in positions)
+        # v5.7 (P5): explicit None check + warning. UI still falls back to 0 for rendering safety;
+        # monitor.save_portfolio_snapshot path already skips writes on None (avoids history corruption).
+        _cash_raw = exe.get_cash_cached()   # v7.1 提速: 首屏用心跳缓存的现金
+        if _cash_raw is None:
+            log.warning("dashboard render: cash API returned None — UI shows $0 but this is API failure, not zero balance")
+        cash = _cash_raw if _cash_raw is not None else 0
+        assets_total = total_value + cash
+        # 尝试读取最新的扫描报告作为候选
+        try:
+            with open("last_scan.md", "r") as f:
+                scan_content = f.read()
+            prompt = DISCOVERY_PROMPT.replace("{positions_list}", scan_content)
+        except:
+            prompt = DISCOVERY_PROMPT.replace("{positions_list}", "(请先用扫描器生成候选市场列表)")
+        _html = render_template_string(HTML, positions=positions, events=events, total_pnl=total_pnl, total_cost=total_cost, total_value=total_value, cash=cash, assets_total=assets_total, time_stop_days=TIME_STOP_DAYS, time_stop_drift_pp=int(TIME_STOP_DRIFT_PP), hold_min_edge_pp=int(HOLD_MIN_EDGE_PP), soft_neg_pp_abs=int(abs(SOFT_NEGATIVE_THRESHOLD_PP)), sl_convergent=int(STOP_LOSS_PCT_BY_TIER['convergent']*100), sl_hybrid=int(STOP_LOSS_PCT_BY_TIER['hybrid']*100), sl_legacy=int(STOP_LOSS_PCT_LEGACY*100), sl_floor_cent=int(EVENT_DRIVEN_FLOOR_PRICE*100), take_profit_price_cent=int(TAKE_PROFIT_PRICE*100), take_profit_pnl_pct=int(TAKE_PROFIT_PNL_PCT*100), prompt=prompt, ver=VERSION)
+        # v5.12: ?desktop=1 → 记 force_desktop cookie 90 天, 手机后续访问 / 不再自动跳 /m
+        if _want_desktop_cookie:
+            from flask import make_response
+            resp = make_response(_html)
+            resp.set_cookie("force_desktop", "1", max_age=90*24*3600, samesite="Lax")
+            return resp
+        return _html
+
+    @app.route("/m")
+    def mobile_page():
+        """v5.12: 手机只读版. 零写操作, 数据全复用 /api/snapshot + /api/realtime_movers + /api/portfolio_history.
+        ?auto=1 → 删 force_desktop cookie, 恢复"手机 UA 打开 / 自动跳 /m"行为."""
+        force_desktop = flask_request.cookies.get("force_desktop") == "1"
+        if flask_request.args.get("auto") == "1":
+            from flask import make_response
+            resp = make_response(render_template_string(MOBILE_HTML, force_desktop=False, ver=VERSION))
+            resp.delete_cookie("force_desktop")
+            return resp
+        return render_template_string(MOBILE_HTML, force_desktop=force_desktop, ver=VERSION)
+
+    @app.route("/history")
+    def history_page():
+        """v5.10: 往期仓位监测页面. JS 自动 fetch /api/history/* 4 个 endpoint 填充 4 个 section."""
+        init_db()
+        return render_template_string(HISTORY_HTML, ver=VERSION)
+
+    @app.route("/api/control", methods=["POST"])
+    def control():
+        data = flask_request.get_json() or {}
+        action = data.get("action","")
+        if action == "check":
+            if _monitor:
+                threading.Thread(target=_monitor.check_once, daemon=True).start()
+                return jsonify({"ok":True,"message":"持仓检查已触发"})
+            return jsonify({"ok":False,"message":"Monitor未运行"})
+        elif action == "refresh":
+            return jsonify({"ok":True,"message":"已刷新"})
+        elif action == "stop":
+            if _monitor: _monitor.stop()
+            import os,signal; os.kill(os.getpid(),signal.SIGTERM)
+            return jsonify({"ok":True,"message":"停止中"})
+        elif action == "scan":
+            keyword = data.get("keyword", "")
+            mode = data.get("mode", "standard")
+            def do_scan():
+                report = scan_and_report(keyword=keyword if keyword else None, include_orderbook=True, mode=mode)
+                with open("last_scan.md", "w") as f:
+                    f.write(report)
+                from modules.db import log_event
+                log_event("scan", keyword or "all", f"{len(report)} chars")
+            threading.Thread(target=do_scan, daemon=True).start()
+            return jsonify({"ok":True,"message":f"扫描启动: {keyword or '全部市场'}"})
+        elif action == "scan_tag":
+            tag = data.get("tag", "")
+            mode = data.get("mode", "standard")
+            if not tag:
+                return jsonify({"ok":False,"message":"缺少tag参数"})
+            from modules.scanner import scan_by_tag
+            def do_tag_scan():
+                report = scan_by_tag(tag, mode=mode)
+                with open("last_scan.md", "w") as f:
+                    f.write(report)
+                from modules.db import log_event
+                log_event("scan_tag", tag, f"mode={mode} {len(report)} chars")
+            threading.Thread(target=do_tag_scan, daemon=True).start()
+            return jsonify({"ok":True,"message":f"Tag扫描启动: {tag} ({mode})"})
+        return jsonify({"ok":False,"message":"未知"})
+
+
+    @app.route("/api/auto_reeval/pending")
+    def auto_reeval_pending():
+        from modules.db import get_pending_auto_reeval
+        import json as _json
+        rows = get_pending_auto_reeval()
+        for r in rows:
+            try:
+                r["sources"] = _json.loads(r.get("sources") or "[]")
+            except Exception:
+                r["sources"] = []
+            r.pop("price_curve", None)  # v7.0: 大字段(曲线 JSON), UI 不用, 不进轮询响应省带宽
+            r.pop("compare_json", None)  # v7.x: GLM 对比输出绝不进主页/面板的 pending 响应 (只 /api/auto_reeval/compare 给)
+        return jsonify({"ok": True, "rows": rows})
+
+    @app.route("/api/auto_reeval/compare")
+    def auto_reeval_compare():
+        """v7.x:「API重评」对比页数据源 — Claude(权威) vs 智谱GLM(参考) 并排。
+        只这个接口吐 compare_json; 主页/控制台/重评建议区都不读它 (GLM 不外泄)。"""
+        from modules.db import get_auto_reeval_compare
+        import json as _json
+        rows = get_auto_reeval_compare(120)
+        for r in rows:
+            r.pop("price_curve", None)            # 大字段不传
+            try:
+                r["sources"] = _json.loads(r.get("sources") or "[]")
+            except Exception:
+                r["sources"] = []
+            try:
+                r["compare"] = _json.loads(r.get("compare_json") or "{}")
+            except Exception:
+                r["compare"] = {}
+            r.pop("compare_json", None)
+            r.pop("raw_text", None)               # 权威 raw 已在 compare 里, 主列不重复传
+        return jsonify({"ok": True, "rows": rows})
+
+    @app.route("/api/auto_reeval/history")
+    def auto_reeval_history():
+        """v6.0.6: 已清空的重评记录 (折叠历史栏) + 每仓冷却倒计时。
+        数据从不删 —— 清空只是归档; 这里把它们捞回来, 附上'还有多久才会自动再评'。"""
+        from modules.db import (get_auto_reeval_history, auto_reeval_latest_per_token,
+                                get_reeval_watch_loss, _parse_iso_to_aware)
+        from modules import auto_reeval as _ar
+        from datetime import datetime, timezone
+        import json as _json
+        rows = get_auto_reeval_history(60)
+        for r in rows:
+            try:
+                r["sources"] = _json.loads(r.get("sources") or "[]")
+            except Exception:
+                r["sources"] = []
+            r.pop("price_curve", None)  # v7.0: 大字段(曲线 JSON), 折叠栏不用, 不进 30s 轮询响应省带宽
+        latest = auto_reeval_latest_per_token()
+        try:
+            held = {p.get("asset") for p in (Executor.get().get_positions_cached() or [])}
+        except Exception:
+            held = set()
+        cd_h = float(getattr(_ar, "COOLDOWN_HOURS", 6) or 6)
+        cd_sec = cd_h * 3600
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            tok = r.get("token_id")
+            lt = latest.get(tok)
+            # 只有'该 token 最新一条记录'才显示冷却 (老记录被新评估取代)
+            if not lt or lt.get("id") != r.get("id"):
+                r["cd_state"] = "superseded"
+                continue
+            if lt.get("status") in ("analyzing", "pending", "manual"):
+                r["cd_state"] = "inflight"      # 还有进行中/待确认的评估
+                continue
+            if tok not in held:
+                r["cd_state"] = "closed"        # 已平仓, 冷却无意义
+                continue
+            dt = _parse_iso_to_aware(lt.get("created_at"))
+            elapsed = (now - dt).total_seconds() if dt else cd_sec + 1
+            if elapsed < cd_sec:
+                r["cd_state"] = "cooling"
+                r["cd_remaining_sec"] = int(cd_sec - elapsed)
+                r["cd_end_ms"] = int((dt.timestamp() + cd_sec) * 1000) if dt else None
+            else:
+                r["cd_state"] = "armed"         # 冷却已过, 等再跌一档(10pp)
+                r["cd_watch_loss"] = get_reeval_watch_loss(tok)
+        return jsonify({"ok": True, "rows": rows, "cooldown_h": cd_h,
+                        "retrigger_pp": int(float(getattr(_ar, "RETRIGGER_DROP_PCT", 0.10)) * 100)})
+
+    @app.route("/api/auto_reeval/trigger", methods=["POST"])
+    def auto_reeval_trigger():
+        """测试用: 对指定 token 立刻跑一次自动重评 (忽略冷却)。"""
+        from modules import auto_reeval
+        from modules.db import save_auto_reeval_pending, get_position_meta
+        import threading as _t
+        data = flask_request.get_json() or {}
+        token_id = (data.get("token_id") or "").strip()
+        if not token_id:
+            return jsonify({"ok": False, "message": "缺少 token_id"})
+        if not auto_reeval.is_enabled():
+            from modules.db import get_api_paused
+            if auto_reeval.is_configured() and get_api_paused():
+                return jsonify({"ok": False, "message": "🛑 API 已紧急暂停 — 先在顶部点「API」恢复再用"})
+            return jsonify({"ok": False, "message": "未启用: 请在 .env 配置 ANTHROPIC_API_KEY 后重启 bot"})
+        exe = Executor.get()
+        pos = next((p for p in exe.get_positions() if p.get("asset") == token_id), None)
+        if not pos:
+            return jsonify({"ok": False, "message": "找不到该持仓"})
+        meta = get_position_meta(token_id) or {}
+        avg = float(pos.get("avg_price") or meta.get("entry_price") or 0)
+        cur = float(pos.get("cur_price") or 0)
+        loss_pct = (avg - cur) / avg if avg > 0 else 0
+        sug_id = save_auto_reeval_pending(token_id, pos, meta, loss_pct, cur, avg)
+        # v5.16: 手动「🤖 API重评」永远 force_manual — 结果挂 pending 等用户确认, 不管在不在线都不自动执行。
+        _t.Thread(target=auto_reeval.run_and_store, args=(sug_id, pos, meta), kwargs={"force_manual": True}, daemon=True).start()
+        return jsonify({"ok": True, "id": sug_id,
+                        "message": f"已触发 (id={sug_id}), 联网调研中, 约 0.5-2 分钟后出建议"})
+
+    @app.route("/api/auto_reeval/confirm", methods=["POST"])
+    def auto_reeval_confirm():
+        """用户确认执行: exit→清仓; update_q→更新 q; hold→记确认。"""
+        from modules.db import (get_auto_reeval, set_auto_reeval_status, apply_auto_reeval_q,
+                                 log_event, clear_position_meta, get_position_meta, save_closed_position)
+        data = flask_request.get_json() or {}
+        sug_id = data.get("id")
+        s = get_auto_reeval(sug_id) if sug_id is not None else None
+        if not s:
+            return jsonify({"ok": False, "message": "建议不存在"})
+        if s.get("status") != "pending":
+            return jsonify({"ok": False, "message": f"该建议状态为 {s.get('status')}, 不可执行"})
+        # v6.0.1 (#6): 原子抢占 pending→executing, 防主页+面板/双击 并发确认同一条 → 下两笔卖单
+        from modules.db import claim_auto_reeval
+        if not claim_auto_reeval(sug_id):
+            return jsonify({"ok": False, "message": "这条建议正在处理 (或已处理), 已跳过重复确认"})
+        token_id = s["token_id"]
+        action = s.get("action")
+        # v7.0: event_driven 护栏 — exit 必须论点破或 edge 明显负才放行, 否则降级 update_q (不在坑底砍事件型)
+        from modules.auto_reeval import guard_event_driven_exit
+        _tier = (get_position_meta(token_id) or {}).get("stop_loss_tier")
+        action, _downgraded, _why = guard_event_driven_exit(action, s, _tier, s.get("cur_price"))
+        if _downgraded:
+            log.warning(f"auto_reeval_confirm id={sug_id}: {_why}")
+        try:
+            if action == "exit":
+                exe = Executor.get()
+                pos = next((p for p in exe.get_positions() if p.get("asset") == token_id), None)
+                if not pos:
+                    set_auto_reeval_status(sug_id, "executed")
+                    return jsonify({"ok": False, "message": "持仓已不存在 (可能已卖出), 已归档建议"})
+                size = pos.get("size") or 0
+                title = pos.get("title", "")
+                meta_pre = get_position_meta(token_id) or {}
+                avg_entry = pos.get("avg_price") or meta_pre.get("entry_price") or 0
+                cur_at = pos.get("cur_price") or 0
+                side = pos.get("outcome") or meta_pre.get("side") or ""
+                ok = exe.sell(token_id, size, "auto_reeval:exit(已确认)")
+                if not ok:
+                    set_auto_reeval_status(sug_id, "pending")  # v6.0.1 (#6): 卖失败/部分成交 → 退回 pending 可重试 (别卡 executing)
+                    return jsonify({"ok": False, "message": "卖出失败/部分成交, 已退回待确认可重试 (看 bot.log)"})
+                log_event("user_sell", title, f"AUTO_REEVAL exit size={size}")
+                try:
+                    save_closed_position(
+                        token_id=token_id, market_slug=meta_pre.get("market_slug") or title,
+                        side=side, avg_entry=avg_entry, exit_price=cur_at, size=size,
+                        exit_reason="AUTO_REEVAL:exit", stop_loss_tier=meta_pre.get("stop_loss_tier"),
+                        claude_raw_estimate=meta_pre.get("claude_raw_estimate") or meta_pre.get("tp"),
+                        entry_at=meta_pre.get("created_at"), cluster_id=meta_pre.get("cluster_id"),
+                        tag=meta_pre.get("tag"))
+                except Exception as e:
+                    log.warning(f"save_closed_position failed (sell ok): {e}")
+                clear_position_meta(token_id)
+                set_auto_reeval_status(sug_id, "executed")
+                return jsonify({"ok": True, "message": f"✓ 已清仓 {title[:30]}"})
+            elif action == "update_q":
+                nq = s.get("new_q")
+                if nq is not None:
+                    apply_auto_reeval_q(token_id, float(nq))
+                    # v5.14 (清单#2): 立刻按新 q 重算决策状态, 别等 monitor 心跳(≤30s)
+                    try:
+                        from modules.db import update_monitor_state
+                        exe = Executor.get()
+                        pos = next((p for p in exe.get_positions() if p.get("asset") == token_id), None)
+                        cur = float(pos.get("cur_price")) if pos else 0
+                        if cur > 0:
+                            edge = (float(nq) - cur) * 100
+                            ns = "HOLD" if edge > HOLD_MIN_EDGE_PP else ("MARGINAL" if edge >= SOFT_NEGATIVE_THRESHOLD_PP else "SOFT_NEGATIVE")
+                            update_monitor_state(token_id, ns)
+                    except Exception as e:
+                        log.warning(f"update_q 后重算 monitor_state 失败: {e}")
+                set_auto_reeval_status(sug_id, "executed")
+                _qmsg = (f"⚠️ 事件型护栏: 未清仓, 改为更新 q → {round((nq or 0)*100)}% (论点未破/edge 未够负)"
+                         if _downgraded else f"✓ 已更新 q → {round((nq or 0)*100)}%")
+                return jsonify({"ok": True, "message": _qmsg})
+            elif action == "cancel_autostop":
+                from modules.db import set_autostop_disabled
+                set_autostop_disabled(token_id, True)
+                set_auto_reeval_status(sug_id, "executed")
+                return jsonify({"ok": True, "message": "✓ 已取消该仓自动止损 (只留 $0.05 地板兜底)"})
+            else:  # hold
+                set_auto_reeval_status(sug_id, "executed")
+                return jsonify({"ok": True, "message": "✓ 已确认继续持有"})
+        except Exception as e:
+            log.exception(f"auto_reeval_confirm: {e}")
+            try:
+                set_auto_reeval_status(sug_id, "pending")  # v6.0.1 (#6): 异常 → 退回 pending 可重试, 别卡 executing
+            except Exception:
+                pass
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/auto_reeval/dismiss", methods=["POST"])
+    def auto_reeval_dismiss():
+        from modules.db import set_auto_reeval_status
+        data = flask_request.get_json() or {}
+        sug_id = data.get("id")
+        if sug_id is None:
+            return jsonify({"ok": False, "message": "缺少 id"})
+        set_auto_reeval_status(sug_id, "dismissed")
+        return jsonify({"ok": True, "message": "已忽略 (留在清单; 是否再自动评由 6h冷却+又跌5pp 控制)"})
+
+    @app.route("/api/auto_reeval/clear", methods=["POST"])
+    def auto_reeval_clear():
+        """单条清空: 从清单移除 (status=cleared)。v6.0.1 后是否再自动评由 6h冷却+又跌5pp 自动控制, 与清空无关。"""
+        from modules.db import set_auto_reeval_status
+        data = flask_request.get_json() or {}
+        sug_id = data.get("id")
+        if sug_id is None:
+            return jsonify({"ok": False, "message": "缺少 id"})
+        set_auto_reeval_status(sug_id, "cleared")
+        return jsonify({"ok": True, "message": "已清空 (从清单移除)"})
+
+    @app.route("/api/auto_reeval/clear_all", methods=["POST"])
+    def auto_reeval_clear_all():
+        """一键清空全部清单 (status=cleared)。再自动评由 6h冷却控制, 与清空无关。"""
+        from modules.db import clear_all_auto_reeval
+        n = clear_all_auto_reeval()
+        return jsonify({"ok": True, "message": f"已清空 {n} 条 (从清单移除)"})
+
+    @app.route("/api/presence")
+    def presence_get():
+        from modules.db import get_presence
+        return jsonify({"ok": True, **get_presence()})
+
+    @app.route("/api/api_paused", methods=["GET", "POST"])
+    def api_paused_route():
+        """v6.0.3: 紧急暂停开关 — 暂停所有自动重评 API (auto 触发/手动 🤖/离线执行 全停)。
+        GET 读状态; POST {paused:bool} 设置。暂停期间持仓不会因重评关了就盲卖 (monitor 用 is_configured 仍冻结在
+        PENDING_REEVAL, 只 $0.05 地板兜底)。主页 + 控制台共用这一个开关 (app_state)。"""
+        from modules.db import get_api_paused, set_api_paused, log_event
+        if flask_request.method == "POST":
+            p = bool((flask_request.get_json() or {}).get("paused"))
+            set_api_paused(p)
+            log_event("api_paused", "", "紧急暂停所有自动重评 API" if p else "恢复自动重评 API")
+            log.warning("API模式: " + ("⏸ 已紧急暂停所有自动重评 API" if p else "▶ 已恢复自动重评 API"))
+            return jsonify({"ok": True, "paused": p,
+                            "message": ("⏸ 已暂停所有自动重评 API (持仓冻结在等重评, 不会盲卖)" if p else "▶ 已恢复自动重评 API")})
+        return jsonify({"ok": True, "paused": get_api_paused()})
+
+    @app.route("/api/presence", methods=["POST"])
+    def presence_set():
+        """设在线/离线 + 活动驱动自动上线 + 会话开始解除抑制。在线 → monitor 暂停自动 API; 离线 → 自动 API 接管。
+        body 字段:
+        - arm=true: 页面加载调一次, 清"手动下线"抑制(不改在线状态), 让本次会话的活动能自动上线。
+        - online=true,auto=true: 活动驱动自动上线, 但被"手动下线"抑制时忽略(防别页刚手动下线被竞态拉回在线)。
+        - online=false,manual=true: 用户手动点下线(要走了) → 置抑制, 收尾的滚动/点击不会又把你拉回在线。
+        - 其它 online=false(无 manual): 系统自动下线(空闲超时) → 不抑制, 回来一动就自动上线。"""
+        from modules.db import set_presence, get_presence, clear_presence_manual_off
+        data = flask_request.get_json() or {}
+        if data.get("arm"):
+            clear_presence_manual_off()
+            return jsonify({"ok": True, **get_presence()})
+        want_online = bool(data.get("online"))
+        if want_online and data.get("auto"):
+            p = get_presence()
+            if p.get("manual_off"):
+                return jsonify({"ok": True, "ignored": True, **p})   # 手动下线抑制中 → 不自动上线
+        set_presence(want_online, manual=bool(data.get("manual")))
+        return jsonify({"ok": True, **get_presence()})
+
+    @app.route("/api/presence/ping", methods=["POST"])
+    def presence_ping_route():
+        """'还在吗'确认 → 刷新在线时间戳, 防过期。"""
+        from modules.db import presence_ping, get_presence
+        presence_ping()
+        return jsonify({"ok": True, **get_presence()})
+
+    @app.route("/panel")
+    def panel_page():
+        """v5.15: 副屏总控台 (新页面, 跟只读 /m 分开)。全 JS 驱动, 复用现有 API。"""
+        return PANEL_HTML
+
+    @app.route("/api_reeval")
+    def api_reeval_page():
+        """v7.x:「API重评」对比页 — Claude(权威) vs 智谱GLM(参考) 并排。只这一页显示 GLM 输出。"""
+        return API_REEVAL_HTML
+
+    # ===== v7.1: 模拟盘 / 测试仓 (paper trading) — 绝不真下单 =====
+    @app.route("/paper")
+    def paper_page():
+        """v7.1: 测试仓页面 (模拟盘)。录入不确定的 Claude 推荐, 按入场价实时盯盘跑同一套算法, 不真下单。"""
+        return PAPER_HTML
+
+    @app.route("/api/paper/list")
+    def paper_list_api():
+        from modules.db import get_paper_positions
+        from datetime import datetime, timezone
+        # v7.x #16: 进行中 = open 且算法还没"卖"(would_sell_at_ts 为空). 已卖/清空/结算 → 归历史(/api/paper/history)
+        rows = [p for p in get_paper_positions("open") if not p.get("would_sell_at_ts")]
+        total = 0.0
+        for p in rows:
+            entry = float(p.get("entry_price") or 0)
+            shares = float(p.get("shares") or 0)
+            if p.get("is_resolved") and p.get("final_outcome") is not None:
+                val_price = float(p.get("final_outcome"))   # 结算: 持有 side 最终 0/1
+            else:
+                val_price = float(p.get("cur_price")) if p.get("cur_price") is not None else entry
+            pnl = (val_price - entry) * shares
+            p["pnl_usd"] = round(pnl, 2)
+            p["pnl_pct"] = round((val_price - entry) / entry * 100, 1) if entry > 0 else 0
+            total += pnl
+            dl = None
+            ed = p.get("end_date")
+            if ed:
+                try:
+                    dt = datetime.fromisoformat(str(ed).replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    dl = (dt - datetime.now(timezone.utc)).days
+                except Exception:
+                    dl = None
+            p["days_left"] = dl
+        return jsonify({"ok": True, "rows": rows, "total_pnl": round(total, 2)})
+
+    @app.route("/api/paper/history")
+    def paper_history_api():
+        """v7.x #16: 往期测试仓 — 算法已"卖"(would_sell) / 已清空 / 已结算 的测试仓 + 统计。
+        每条算: 最终模拟盈亏 / 最高点(peak, 哪怕后来亏到底) / 预测准不准结论。纯只读, 不动钱。"""
+        from modules.db import get_paper_positions
+        open_sold = [p for p in get_paper_positions("open") if p.get("would_sell_at_ts")]  # 算法已"卖"但还在盯结算
+        rows = open_sold + get_paper_positions("resolved") + get_paper_positions("cleared")
+        out = []
+        for p in rows:
+            entry = float(p.get("entry_price") or 0)
+            shares = float(p.get("shares") or 0)
+            cur = float(p["cur_price"]) if p.get("cur_price") is not None else entry
+            peak = float(p["peak_price"]) if p.get("peak_price") is not None else entry
+            resolved = bool(p.get("is_resolved")) and p.get("final_outcome") is not None
+            # 最终模拟盈亏: 结算→按最终 0/1; 已"卖"→按 would_sell 那刻; 否则→按现价
+            if resolved:
+                final_pnl = (float(p["final_outcome"]) - entry) * shares
+            elif p.get("would_sell_at_ts") and p.get("would_sell_pnl_usd") is not None:
+                final_pnl = float(p["would_sell_pnl_usd"])
+            else:
+                final_pnl = (cur - entry) * shares
+            p["final_pnl_usd"] = round(final_pnl, 2)
+            p["final_pnl_pct"] = round(final_pnl / (entry * shares) * 100, 1) if (entry * shares) else 0
+            p["peak_pnl_usd"] = round((peak - entry) * shares, 2)   # 最高点本可赚多少
+            p["peak_price"] = round(peak, 4)
+            p["hist_kind"] = "resolved" if resolved else ("sold" if p.get("would_sell_at_ts") else "cleared")
+            out.append(p)
+        # 排序: 最近的在前 (would_sell_at_ts / resolved_at / created_at)
+        out.sort(key=lambda p: (p.get("resolved_at") or "") + (str(p.get("would_sell_at_ts") or "")) + (p.get("created_at") or ""), reverse=True)
+        n = len(out)
+        rlist = [p for p in out if p["hist_kind"] == "resolved"]
+        win = sum(1 for p in rlist if (p.get("final_outcome") or 0) >= 0.5)
+        profit = sum(1 for p in out if p["final_pnl_usd"] > 0)
+        stats = {
+            "count": n,
+            "resolved_count": len(rlist),
+            "win_count": win,
+            "win_rate": (win / len(rlist)) if rlist else None,
+            "profit_count": profit,
+            "profit_rate": (profit / n) if n else None,
+            "total_pnl_usd": round(sum(p["final_pnl_usd"] for p in out), 2),
+        }
+        return jsonify({"ok": True, "rows": out, "stats": stats})
+
+    @app.route("/api/paper/add", methods=["POST"])
+    def paper_add_api():
+        """录入测试仓: 按 slug+side 从 Gamma 解析 token_id/标题/结算日, 存 paper_positions。不真下单。
+        金额 (v7.1.1): 显式 size_usd>0 → 直接用 (手动表单); 否则按主页同一套 sizing 公式自动算
+        (q/入场价/信心/止损档/距结算/cluster, 跟 /api/suggested_size 一致), 公式=0(不建议)/拿不到 bankroll
+        → 退回 fallback_usd (默认 10)。这样粘 JSON / 主页一键 都不用手填金额。"""
+        from modules.db import add_paper_position, log_event
+        import requests as _req, json as _json
+        data = flask_request.get_json() or {}
+        slug = (data.get("slug") or "").strip()
+        side = (data.get("side") or "").strip().lower()
+        try:
+            entry = float(data.get("entry_price"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "message": "入场价无效"})
+        if not slug or side not in ("yes", "no") or not (entry > 0):
+            return jsonify({"ok": False, "message": "slug / 方向 / 入场价 必填且有效"})
+        side = "Yes" if side == "yes" else "No"
+        token_id = None
+        title = slug
+        end_date = data.get("end_date")
+        try:
+            gr = _req.get("https://gamma-api.polymarket.com/markets",
+                          params={"slug": slug, "limit": 1}, timeout=10).json()
+            if gr and isinstance(gr, list) and gr:
+                m = gr[0]
+                title = m.get("question") or slug
+                if not end_date:
+                    end_date = m.get("endDate")
+                toks = m.get("clobTokenIds"); outs = m.get("outcomes")
+                toks = _json.loads(toks) if isinstance(toks, str) else (toks or [])
+                outs = _json.loads(outs) if isinstance(outs, str) else (outs or [])
+                for i, o in enumerate(outs):
+                    if str(o).strip().lower() == side.lower() and i < len(toks):
+                        token_id = toks[i]; break
+        except Exception as e:
+            log.warning(f"paper_add gamma resolve err: {e}")
+        if not token_id:
+            return jsonify({"ok": False, "message": f"没从 Polymarket 查到该 slug 的 {side} token (slug 对吗? 已结算的查不到)"})
+        # === 金额: 显式 size_usd>0 优先; 否则按主页同一套 sizing 公式自动算 ===
+        try:
+            _explicit = float(data.get("size_usd") or 0)
+        except (TypeError, ValueError):
+            _explicit = 0.0
+        if _explicit > 0:
+            size_usd, size_reason = _explicit, "用户填写"
+        else:
+            try:
+                fallback = float(data.get("fallback_usd") or 10) or 10.0
+            except (TypeError, ValueError):
+                fallback = 10.0
+            size_usd, size_reason = fallback, "兜底"
+            try:
+                from modules.sizing import position_size_usd, _cfg
+                from modules.clusters import cluster_exposure_usd, portfolio_exposed_dd_usd, bankroll_usd
+                from datetime import timezone as _tz
+                q = float(data.get("q") or 0)
+                days = data.get("days_to_resolution")
+                try:
+                    days = int(days)
+                except (TypeError, ValueError):
+                    days = None
+                if days is None and end_date:
+                    try:
+                        _dt = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                        if _dt.tzinfo is None:
+                            _dt = _dt.replace(tzinfo=_tz.utc)
+                        days = max(0, (_dt - datetime.now(_tz.utc)).days)
+                    except Exception:
+                        days = None
+                if days is None:
+                    days = 30
+                br = bankroll_usd()
+                if br is not None and q > 0:
+                    cap = br * _cfg("CLUSTER_CAP_PCT")
+                    # v7.1.3: 测试仓不受真仓 cluster 集中度限制 (用户明确: cluster cap 是真钱防过度集中的风控,
+                    # 测试仓只为验证推荐准不准, 不该被同类真仓挤掉额度) → 当前 cluster 敞口按 0 传, cap 形同虚设。
+                    cexp = 0.0
+                    sz, rsn = position_size_usd(
+                        q=q, p=entry, confidence=(data.get("confidence") or "medium"),
+                        stop_loss_tier=(data.get("stop_loss_tier") or "hybrid"),
+                        days_to_resolution=days, bankroll_usd=br,
+                        cluster_current_exposure_usd=cexp, cluster_cap_usd=cap,
+                        exposed_dd_usd=portfolio_exposed_dd_usd())
+                    if sz and sz > 0:
+                        size_usd, size_reason = sz, rsn
+                    else:
+                        size_reason = "公式=0不建议 → 兜底$%.0f" % fallback
+                else:
+                    size_reason = "无bankroll/q → 兜底$%.0f" % fallback
+            except Exception as e:
+                log.warning(f"paper_add auto-size err: {e}")
+                size_reason = f"sizing异常→兜底: {e}"
+        if not (size_usd > 0):
+            return jsonify({"ok": False, "message": "金额无效 (公式算 0 且无兜底)"})
+        pid = add_paper_position(
+            token_id=token_id, market_slug=slug, title=title, side=side,
+            entry_price=entry, size_usd=size_usd, q=data.get("q"), confidence=data.get("confidence"),
+            stop_loss_tier=(data.get("stop_loss_tier") or None), cluster_id=data.get("cluster_id"),
+            tag=data.get("tag"), end_date=end_date, notes=data.get("notes"))
+        log_event("paper_add", title, f"测试仓录入 {side} @ ${entry:.3f} ${size_usd:.0f} ({size_reason})")
+        return jsonify({"ok": True, "id": pid, "title": title, "size_usd": round(size_usd, 2), "size_reason": size_reason})
+
+    @app.route("/api/paper/clear", methods=["POST"])
+    def paper_clear_api():
+        from modules.db import clear_paper_position
+        data = flask_request.get_json() or {}
+        pid = data.get("id")
+        ok = clear_paper_position(pid) if pid is not None else False
+        return jsonify({"ok": ok})
+
+    @app.route("/api/paper/clear_all", methods=["POST"])
+    def paper_clear_all_api():
+        from modules.db import clear_all_paper_positions
+        return jsonify({"ok": True, "n": clear_all_paper_positions()})
+
+    @app.route("/api/paper/reeval_prompt")
+    def paper_reeval_prompt_api():
+        """v7.1 阶段2: 测试仓【手动】重评提示词 (复用真仓那份 build_reeval_prompt + 反锚定中枢)。
+        ⚠️ 全程只读: build_reeval_prompt(纯字符串) + _pre_dump_center(只拉历史价) + Gamma(只读)。
+        绝不调任何付费 API (不碰 auto_reeval.run_*), 用户自己贴去 Claude.ai 免费重评。"""
+        from modules.db import get_paper_positions
+        from modules.prompts import build_reeval_prompt
+        import requests as _req
+        from datetime import datetime, timezone
+        pid = flask_request.args.get("id", type=int)
+        rows = [p for p in (get_paper_positions("open") + get_paper_positions("resolved")) if p["id"] == pid]
+        if not rows:
+            return jsonify({"ok": False, "message": "测试仓不存在"})
+        p = rows[0]
+        tok = p.get("token_id")
+        cur = float(p.get("cur_price") or p.get("entry_price") or 0)
+        meta = {"side": p.get("side"), "entry_price": p.get("entry_price"), "tp": p.get("q"),
+                "new_tp": p.get("q"), "end_date": p.get("end_date"), "market_slug": p.get("market_slug"),
+                "original_confidence": p.get("confidence"), "created_at": p.get("created_at"),
+                "claude_raw_estimate": p.get("q"), "entry_reason": p.get("notes")}
+        try:  # Gamma question + resolution 原文 (只读)
+            gr = _req.get("https://gamma-api.polymarket.com/markets",
+                          params={"clob_token_ids": tok, "limit": 1}, timeout=8).json()
+            if gr and isinstance(gr, list) and gr:
+                if gr[0].get("question"):
+                    meta["_market_question"] = gr[0]["question"]
+                if gr[0].get("description"):
+                    meta["_market_description"] = gr[0]["description"]
+        except Exception:
+            pass
+        center = None  # 反锚定中枢 (只读历史价, 跟真仓一样)
+        try:
+            from modules import auto_reeval
+            center = auto_reeval._pre_dump_center(tok, cur)
+        except Exception:
+            pass
+        days = None
+        if meta.get("end_date"):
+            try:
+                dt = datetime.fromisoformat(str(meta["end_date"]).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                days = (dt - datetime.now(timezone.utc)).days
+            except Exception:
+                days = None
+        prompt = build_reeval_prompt(meta, cur, days if days is not None else 0, pre_dump_center=center)
+        return jsonify({"ok": True, "prompt": prompt})
+
+    @app.route("/api/paper/update_q", methods=["POST"])
+    def paper_update_q_api():
+        """v7.1 阶段2: 手动重评读到新 q 后, 应用到测试仓。纯改 DB, 不碰钱。"""
+        from modules.db import update_paper_q
+        data = flask_request.get_json() or {}
+        pid = data.get("id")
+        try:
+            q = float(data.get("q"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "message": "q 无效"})
+        if not (0 < q < 1):
+            return jsonify({"ok": False, "message": "q 要在 0-1 之间"})
+        ok = update_paper_q(pid, q) if pid is not None else False
+        return jsonify({"ok": ok})
+
+    # 真·Chrome 离线小恐龙 (wayou/t-rex-runner, BSD-3, vendored 在 data/dino/).
+    # /panel 底部「🦖 来一局」按钮 → modal iframe src=/dino/. index.html 里 img/*.png +
+    # scripts/runner.js 是相对路径, 所以挂 /dino/ (带斜杠), asset 走 /dino/<path>.
+    _dino_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dino")
+
+    @app.route("/dino/")
+    def dino_index():
+        return send_from_directory(_dino_dir, "index.html")
+
+    @app.route("/dino/<path:f>")
+    def dino_asset(f):
+        return send_from_directory(_dino_dir, f)
+
+    @app.route("/api/force_exit", methods=["POST"])
+    def force_exit():
+        """用户在重评流程中选 exit 时直接清仓"""
+        from modules.db import (log_event, mark_executed_action, clear_position_meta,
+                                 get_position_meta, save_closed_position)
+        try:
+            data = flask_request.get_json() or {}
+            token_id = data.get("token_id", "")
+            reason = (data.get("reason") or "force_exit").strip()[:500]  # v5.7 (P9): cap reason length
+            if not token_id:
+                return jsonify({"ok": False, "message": "缺少 token_id"})
+
+            exe = Executor.get()
+            pos = None
+            for p in exe.get_positions():
+                if p.get("asset") == token_id:
+                    pos = p
+                    break
+            if not pos:
+                return jsonify({"ok": False, "message": "找不到该持仓"})
+
+            size = pos.get("size") or 0
+            title = pos.get("title", "")
+            # v5.7 (P7): capture entry context BEFORE sell so we can build closed_positions row.
+            meta_pre = get_position_meta(token_id) or {}
+            avg_entry = pos.get("avg_price") or meta_pre.get("entry_price") or 0
+            cur_price_at_exit = pos.get("cur_price") or 0
+            side = pos.get("outcome") or meta_pre.get("side") or ""
+
+            log.info(f"FORCE_EXIT [{reason}] {title[:40]} size={size}")
+            ok = exe.sell(token_id, size, f"force_exit:{reason}")
+
+            if ok:
+                log_event("user_sell", title, f"FORCE_EXIT size={size} {reason}")
+                # v5.7 (P7): persist closed_positions row for PnL/calibration analytics.
+                try:
+                    save_closed_position(
+                        token_id=token_id,
+                        market_slug=meta_pre.get("market_slug") or title,
+                        side=side,
+                        avg_entry=avg_entry,
+                        exit_price=cur_price_at_exit,
+                        size=size,
+                        exit_reason=f"FORCE_EXIT:{reason}",
+                        stop_loss_tier=meta_pre.get("stop_loss_tier"),
+                        claude_raw_estimate=meta_pre.get("claude_raw_estimate") or meta_pre.get("tp"),
+                        entry_at=meta_pre.get("created_at"),
+                        cluster_id=meta_pre.get("cluster_id"),   # v5.10
+                        tag=meta_pre.get("tag"),                  # v5.10
+                    )
+                except Exception as e:
+                    log.warning(f"save_closed_position failed (sell still succeeded): {e}")
+                # 平仓后清理 meta, 下次买回是白纸
+                clear_position_meta(token_id)
+                log.info(f"force_exit 后清理 meta: {title[:40]}")
+                return jsonify({"ok": True, "message": f"已整笔清仓 ({size} 股)"})
+            else:
+                return jsonify({"ok": False, "message": "卖出失败, 看 bot.log"})
+        except Exception as e:
+            log.exception(f"force_exit error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/execute_state", methods=["POST"])
+    def execute_state():
+        """用户点击徽章后, 按当前 monitor_state 执行清仓"""
+        from modules.db import (get_position_meta, log_event, mark_executed_action,
+                                 update_monitor_state, clear_position_meta, save_closed_position)
+        try:
+            data = flask_request.get_json() or {}
+            token_id = data.get("token_id", "")
+            confirmed_state = data.get("state", "")
+            # v5.7 (P9): whitelist confirmed_state
+            if confirmed_state not in ("AT_TARGET",):
+                return jsonify({"ok": False, "message": f"不允许的 state: {confirmed_state}"})
+            if not token_id:
+                return jsonify({"ok": False, "message": "缺少 token_id"})
+
+            meta = get_position_meta(token_id)
+            if not meta:
+                return jsonify({"ok": False, "message": "找不到 meta"})
+
+            # 拉持仓
+            exe = Executor.get()
+            positions = exe.get_positions()
+            pos = None
+            for p in positions:
+                if p.get("asset") == token_id:
+                    pos = p
+                    break
+            if not pos:
+                return jsonify({"ok": False, "message": "找不到该持仓"})
+
+            current_state = meta.get("monitor_state") or "?"
+            if current_state != confirmed_state:
+                return jsonify({"ok": False, "message": f"状态已变化 ({current_state}), 请刷新页面再试"})
+
+            # v5.7 (P12): re-verify the AT_TARGET condition live (cur_price ≥ q) instead of
+            # only trusting db.monitor_state which may be stale between heartbeats.
+            cur_p = pos.get("cur_price") or 0
+            q = meta.get("new_tp") or meta.get("tp") or 0
+            if confirmed_state == "AT_TARGET" and not (q > 0 and cur_p >= q):
+                return jsonify({"ok": False,
+                                "message": f"已不再 AT_TARGET (cur=${cur_p:.3f} q=${q:.3f}). 请刷新页面"})
+
+            size = pos.get("size") or 0
+            title = pos.get("title", "")
+            avg_entry = pos.get("avg_price") or meta.get("entry_price") or 0
+            side = pos.get("outcome") or meta.get("side") or ""
+
+            # 决定卖多少
+            sell_size = size
+            action_tag = "user_exited_at_target"
+            reason = f"AT_TARGET: 用户确认整笔清仓 ({size} 股)"
+
+            log.info(f"USER_EXECUTE [{confirmed_state}] {title[:40]} sell={sell_size}")
+            ok = exe.sell(token_id, sell_size, reason)
+
+            if ok:
+                log_event("user_sell", title, f"{confirmed_state} size={sell_size} {reason}")
+                # v5.7 (P7): persist closed_positions for analytics.
+                try:
+                    save_closed_position(
+                        token_id=token_id,
+                        market_slug=meta.get("market_slug") or title,
+                        side=side,
+                        avg_entry=avg_entry,
+                        exit_price=cur_p,
+                        size=size,
+                        exit_reason=f"USER_AT_TARGET",
+                        stop_loss_tier=meta.get("stop_loss_tier"),
+                        claude_raw_estimate=meta.get("claude_raw_estimate") or meta.get("tp"),
+                        entry_at=meta.get("created_at"),
+                        cluster_id=meta.get("cluster_id"),   # v5.10
+                        tag=meta.get("tag"),                  # v5.10
+                    )
+                except Exception as e:
+                    log.warning(f"save_closed_position failed (sell still succeeded): {e}")
+                # 平仓后清理 meta, 下次买回是白纸
+                clear_position_meta(token_id)
+                log.info(f"execute_state 后清理 meta: {title[:40]}")
+                return jsonify({"ok": True, "message": f"已执行: {reason}"})
+            else:
+                return jsonify({"ok": False, "message": "卖出失败, 看 bot.log"})
+        except Exception as e:
+            log.exception(f"execute_state error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/movers")
+    def movers():
+        """涨跌榜: 持仓里过去 1d/1w 价格变化, 返回全部 (前端切 Top 3 / All)."""
+        from concurrent.futures import ThreadPoolExecutor
+        exe = Executor.get()
+        rng = (flask_request.args.get("range") or "1d").lower()
+        force = (flask_request.args.get("force") or "0") == "1"
+        interval = "1w" if rng in ("1w", "7d") else "1d"
+        positions = exe.get_positions_cached() or []   # v7.1 提速: 缓存
+        if not positions:
+            return jsonify({"ok": True, "range": rng, "gainers": [], "losers": []})
+        def compute(p):
+            tid = p.get("asset")
+            if not tid:
+                return None
+            hist = exe.get_prices_history(tid, interval=interval, force=force)
+            if not hist or len(hist) < 2:
+                return None
+            first_price = hist[0].get("p") or 0
+            last_price = hist[-1].get("p") or p.get("cur_price") or 0
+            if first_price <= 0:
+                return None
+            change_pp = (last_price - first_price) * 100
+            change_pct = (last_price - first_price) / first_price * 100
+            sz = p.get("size") or 0
+            return {
+                "title": p.get("title", ""),
+                "asset": tid,
+                "side": p.get("side", ""),
+                "size": sz,
+                "first_price": first_price,
+                "last_price": last_price,
+                "change_pp": change_pp,
+                "change_pct": change_pct,
+                "change_dollar": (last_price - first_price) * sz,
+            }
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = [r for r in pool.map(compute, positions) if r]
+        sorted_by_change = sorted(results, key=lambda x: x["change_pp"], reverse=True)
+        gainers = [m for m in sorted_by_change if m["change_pp"] > 0]
+        losers = [m for m in reversed(sorted_by_change) if m["change_pp"] < 0]
+        return jsonify({"ok": True, "range": rng, "gainers": gainers, "losers": losers})
+
+    @app.route("/api/buy_preview")
+    def buy_preview():
+        """加仓预览: 拉 best_ask + 估算 size. 不下单."""
+        import math
+        exe = Executor.get()
+        token_id = flask_request.args.get("token_id", "")
+        try:
+            usd = float(flask_request.args.get("usd", "0"))
+        except Exception:
+            return jsonify({"ok": False, "message": "usd 参数无效"})
+        if not token_id or usd < 1:
+            return jsonify({"ok": False, "message": "需要 token_id 和 usd≥1"})
+        best_ask = exe.get_best_ask(token_id)
+        if not best_ask:
+            return jsonify({"ok": False, "message": "盘口无 ask"})
+        size = math.floor(usd / best_ask * 100) / 100
+        if size < 0.01:
+            return jsonify({"ok": False, "message": f"金额太小, ask={best_ask:.3f} 估算 size={size}"})
+        return jsonify({"ok": True, "best_ask": best_ask, "size": size, "estimated_cost": size * best_ask})
+
+    @app.route("/api/buy_position", methods=["POST"])
+    def buy_position():
+        """加仓: 调 executor.buy()"""
+        exe = Executor.get()
+        data = flask_request.get_json() or {}
+        token_id = data.get("token_id", "")
+        try:
+            usd = float(data.get("usd_amount", 0))
+        except Exception:
+            return jsonify({"ok": False, "message": "usd_amount 无效"})
+        # v5.7 (P9): cap usd <= 500 to prevent runaway POST (one-button-press disaster)
+        if not token_id or usd < 1 or usd > 500:
+            return jsonify({"ok": False, "message": "token_id 缺失或 usd 不在 [1, 500] 内"})
+        # 拿仓位 title (for events log)
+        positions = exe.get_positions() or []
+        title = next((p.get("title", "") for p in positions if p.get("asset") == token_id), token_id[:20])
+        ok, msg = exe.buy(token_id, usd, reason=data.get("reason", "manual_add"))
+        if ok:
+            from modules.db import log_event
+            log_event("user_buy", title, f"加仓 ${usd:.2f}  {msg}")
+        return jsonify({"ok": ok, "message": msg})
+
+    @app.route("/api/realtime_movers")
+    def realtime_movers():
+        """实时榜: 短窗口 (30m/1h) 变化最大的 Top N, 按 |change| 排序 (混合涨跌)."""
+        from concurrent.futures import ThreadPoolExecutor
+        exe = Executor.get()
+        rng = (flask_request.args.get("range") or "30m").lower()
+        force = (flask_request.args.get("force") or "0") == "1"
+        positions = exe.get_positions_cached() or []   # v7.1 提速: 缓存
+        if not positions:
+            return jsonify({"ok": True, "range": rng, "items": []})
+        # v7.x (#7): 4 档. 30m 在 1h 数据里取倒数第7点 (5min×6=30min); 6h/1d 换更大 interval。
+        _RT_CFG = {
+            "30m": {"interval": "1h", "fidelity": "5",  "back": 7},
+            "1h":  {"interval": "1h", "fidelity": "5",  "back": 0},
+            "6h":  {"interval": "6h", "fidelity": "30", "back": 0},
+            "1d":  {"interval": "1d", "fidelity": "60", "back": 0},
+        }
+        cfg = _RT_CFG.get(rng, _RT_CFG["30m"])
+        def compute(p):
+            tid = p.get("asset")
+            if not tid:
+                return None
+            hist = exe.get_prices_history(tid, interval=cfg["interval"], fidelity=cfg["fidelity"], force=force, max_age=60)
+            if not hist or len(hist) < 2:
+                return None
+            last = hist[-1]
+            if cfg["back"] > 0:
+                first = hist[-min(cfg["back"], len(hist))]
+            else:
+                first = hist[0]
+            first_price = first.get("p") or 0
+            last_price = last.get("p") or p.get("cur_price") or 0
+            if first_price <= 0:
+                return None
+            change_pp = (last_price - first_price) * 100
+            sz = p.get("size") or 0
+            return {
+                "title": p.get("title", ""),
+                "asset": tid,
+                "side": p.get("side", ""),
+                "size": sz,
+                "first_price": first_price,
+                "last_price": last_price,
+                "change_pp": change_pp,
+                "change_pct": (last_price - first_price) / first_price * 100,
+                "change_dollar": (last_price - first_price) * sz,
+                "first_ts": first.get("t"),
+                "last_ts": last.get("t"),
+            }
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = [r for r in pool.map(compute, positions) if r]
+        results.sort(key=lambda x: abs(x["change_pp"]), reverse=True)
+        return jsonify({"ok": True, "range": rng, "items": results})
+
+    @app.route("/api/holdings_rank")
+    def holdings_rank():
+        """持仓现值榜: 按 cur_price × size 降序."""
+        exe = Executor.get()
+        positions = exe.get_positions_cached() or []   # v7.1 提速: 缓存
+        items = []
+        for p in positions:
+            cur = p.get("cur_price") or 0
+            size = p.get("size") or 0
+            avg = p.get("avg_price") or 0
+            value = cur * size
+            items.append({
+                "title": p.get("title", ""),
+                "asset": p.get("asset", ""),
+                "side": p.get("side", ""),
+                "cur_price": cur,
+                "avg_price": avg,
+                "size": size,
+                "value": value,
+                "pnl_dollar": (cur - avg) * size,
+                "pnl_pct": p.get("pnl_pct", 0),
+            })
+        items.sort(key=lambda x: x["value"], reverse=True)
+        return jsonify({"ok": True, "items": items})
+
+    @app.route("/api/portfolio_history")
+    def portfolio_history():
+        """资产总值历史曲线. range: 1d|1w|1m|1y|ytd|all"""
+        from modules.db import get_portfolio_history
+        import time
+        from datetime import datetime, timezone
+        r = (flask_request.args.get("range") or "1d").lower()
+        now = int(time.time())
+        if r == "1d":
+            since = now - 86400
+        elif r == "1w":
+            since = now - 7*86400
+        elif r == "1m":
+            since = now - 30*86400
+        elif r == "1y":
+            since = now - 365*86400
+        elif r == "ytd":
+            ytd_dt = datetime(datetime.now(timezone.utc).year, 1, 1, tzinfo=timezone.utc)
+            since = int(ytd_dt.timestamp())
+        else:
+            since = 0
+        try:
+            rows = get_portfolio_history(since)
+            return jsonify({"ok": True, "range": r, "points": rows})
+        except Exception as e:
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/trade_markers")
+    def trade_markers():
+        """v7.x (#2): 资产曲线上的买卖点标记 — closed_positions 的 entry_at(买)/exit_at(卖)。
+        返回全量 (前端按当前曲线时间范围裁)。纯只读, 不动钱。"""
+        from modules.db import get_conn, _parse_iso_to_aware
+        out = []
+        try:
+            conn = get_conn()
+            for r in conn.execute(
+                "SELECT market_slug, side, avg_entry_price, exit_price, realized_pnl_usd, entry_at, exit_at "
+                "FROM closed_positions ORDER BY id DESC LIMIT 400").fetchall():
+                title = r["market_slug"] or ""
+                if r["entry_at"]:
+                    out.append({"iso": r["entry_at"], "type": "buy", "title": title,
+                                "price": r["avg_entry_price"], "side": r["side"]})
+                if r["exit_at"]:
+                    out.append({"iso": r["exit_at"], "type": "sell", "title": title,
+                                "price": r["exit_price"], "pnl": r["realized_pnl_usd"], "side": r["side"]})
+            conn.close()
+            markers = []
+            for m in out:
+                dt = _parse_iso_to_aware(m.pop("iso"))
+                if dt:
+                    m["ts"] = int(dt.timestamp())
+                    markers.append(m)
+            return jsonify({"ok": True, "markers": markers})
+        except Exception as e:
+            return jsonify({"ok": False, "message": str(e), "markers": []})
+
+    @app.route("/api/snapshot")
+    def snapshot():
+        """v4: 返回持仓快照 + monitor_state + edge计算"""
+        try:
+            from modules.db import get_position_meta, needs_reeval
+            from datetime import datetime, timezone, timedelta
+            
+            exe = Executor.get()
+            positions = exe.get_positions_cached()   # v7.1 提速: 用心跳缓存, 不每次 poll 都打 data-api(timeout 30s)
+            rows = []
+            total_pnl = 0.0
+            total_cost = 0.0
+            total_value = 0.0
+            # v5.7 (P5): explicit None check; UI fallback 0, log warns so failure not silent.
+            _cash_raw = exe.get_cash_cached()         # v7.1 提速: 用心跳缓存的现金
+            if _cash_raw is None:
+                log.warning("/api/snapshot: cash API returned None (showing $0)")
+            cash = _cash_raw if _cash_raw is not None else 0
+
+            for p in positions:
+                cp = p.get("cur_price") or 0
+                ap = p.get("avg_price") or 0
+                sz = p.get("size") or 0
+                asset = p.get("asset", "")
+                pnl_pct = ((cp - ap) / ap * 100) if ap > 0 else 0
+                
+                meta = get_position_meta(asset) or {}
+                q = meta.get("new_tp") or meta.get("tp")
+                edge_pp = ((q - cp) * 100) if q else None
+                
+                # 24h重评提醒
+                reeval_due = needs_reeval(asset, hours=24) if meta else False
+                
+                # 距结算天数
+                days_left = None
+                end_date = meta.get("end_date") or ""
+                if end_date:
+                    try:
+                        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        if end_dt.tzinfo is None: end_dt = end_dt.replace(tzinfo=timezone.utc)  # naive 当 UTC
+                        days_left = (end_dt - datetime.now(timezone.utc)).days
+                    except Exception:
+                        pass
+                
+                rows.append({
+                    "asset": asset,
+                    # v5.12: title/side/avg_price/size 给手机版 /m 渲染用 (additive, 桌面 JS 忽略)
+                    "title": p.get("title", ""),
+                    "side": p.get("side", ""),
+                    "avg_price": ap,
+                    "size": sz,
+                    "cur_price": cp,
+                    "value": cp * sz,
+                    "pnl_pct": pnl_pct,
+                    "pnl_dollar": (cp - ap) * sz,
+                    "q": q,
+                    "edge_pp": edge_pp,
+                    "monitor_state": meta.get("monitor_state") or "PENDING",
+                    "executed_action": meta.get("executed_action") or "",
+                    "days_left": days_left,
+                    "needs_reeval": reeval_due,
+                    "autostop_disabled": bool(meta.get("autostop_disabled")),
+                    "last_reeval_at": meta.get("last_reeval_at") or meta.get("created_at"),
+                })
+                total_pnl += (cp - ap) * sz
+                total_cost += ap * sz
+                total_value += cp * sz
+            
+            return jsonify({
+                "ok": True,
+                "positions": rows,
+                "total_pnl": total_pnl,
+                "total_cost": total_cost,
+                "total_value": total_value,
+                "cash": cash,
+                "assets_total": total_value + cash,
+                "position_count": len(rows),
+            })
+        except Exception as e:
+            log.exception(f"snapshot error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/update_q", methods=["POST"])
+    def update_q_route():
+        """
+        v4: 用户重评后更新 q (calibrated probability).
+        会自动: 
+          1. 写入 new_tp + last_reeval_at
+          2. 维护 last_q_update_with_negative_edge (SOFT/CONFIRMED 状态机)
+          3. 触发一次 monitor 心跳重新计算 monitor_state
+        body: { token_id, new_q (0-1), reason? }
+        return: { ok, monitor_state, edge_pp, message }
+        """
+        from modules.db import get_position_meta, update_q_value, log_event
+        from modules.monitor import PositionMonitor
+        try:
+            data = flask_request.get_json() or {}
+            token_id = data.get("token_id", "")
+            new_q = data.get("new_q")
+            reason = (data.get("reason") or "").strip()
+            
+            if not token_id:
+                return jsonify({"ok": False, "message": "缺少 token_id"})
+            # v5.7 (P10): fetch meta upfront so log_event can use real market_slug
+            # (previously hard-coded "(unknown)" which broke audit trail).
+            meta_for_slug = get_position_meta(token_id)
+            real_slug = (meta_for_slug.get("market_slug") if meta_for_slug else None) or "(unknown)"
+            # new_q 为 None 表示"维持原 q, 仅记录重评时间" (markReevalHold 用)
+            if new_q is None:
+                from modules.db import get_conn, _utc_now_iso  # v5.7 (P3): aware UTC
+                conn = get_conn()
+                conn.execute("UPDATE position_meta SET last_reeval_at=? WHERE token_id=?",
+                             (_utc_now_iso(), token_id))
+                conn.commit(); conn.close()
+                log_event("update_q", real_slug, f"hold_no_change | {reason[:80]}")
+                return jsonify({"ok": True, "message": "已记录重评 (q 维持原值)", "monitor_state": "(unchanged)"})
+            try:
+                new_q = float(new_q)
+            except (ValueError, TypeError):
+                return jsonify({"ok": False, "message": "new_q 必须是数字"})
+            if not (0 < new_q < 1):
+                return jsonify({"ok": False, "message": "new_q 必须在 0-1 之间"})
+            
+            meta = get_position_meta(token_id)
+            if not meta:
+                return jsonify({"ok": False, "message": "找不到该仓位 meta, 先填 TP 再重评"})
+
+            # v5.10.1: 删除"new_q 必须 > entry_price" 硬限制. 用户重评时可能下调 q
+            # (Claude 给出 exit 建议但用户不想立刻清仓, 想先压低 q 让 monitor 触发
+            # SOFT_NEGATIVE/AT_TARGET). 这是合法操作, 不应被入场 entry 价格挡住.
+
+            # 写入 (会自动维护 last_q_update_with_negative_edge)
+            update_q_value(token_id, new_q)
+            
+            # 记 event log
+            old_q = meta.get("new_tp") or meta.get("tp") or 0
+            log_event("update_q", meta.get("market_slug") or "?", 
+                      f"q: {old_q:.3f} -> {new_q:.3f} | {reason[:80]}")
+            
+            # v7.1 提速: 只重算这一仓的 edge 状态 (别跑整轮 check_once —— 那会 N 次联网, 让"改q"按钮卡几秒)
+            try:
+                from modules.db import update_monitor_state
+                _pos = next((p for p in (Executor.get().get_positions_cached() or []) if p.get("asset") == token_id), None)
+                _cur = float(_pos.get("cur_price")) if _pos else 0
+                if _cur > 0:
+                    _edge = (float(new_q) - _cur) * 100
+                    _ns = "HOLD" if _edge > HOLD_MIN_EDGE_PP else ("MARGINAL" if _edge >= SOFT_NEGATIVE_THRESHOLD_PP else "SOFT_NEGATIVE")
+                    update_monitor_state(token_id, _ns)
+            except Exception as _e:
+                log.warning(f"update_q 单仓重算状态失败: {_e}")
+
+            # 读最新状态返回给前端
+            updated_meta = get_position_meta(token_id)
+            new_state = updated_meta.get("monitor_state") if updated_meta else "?"
+            
+            # 拉当前价算 edge
+            exe = Executor.get()
+            cur_price = None
+            for p in exe.get_positions():
+                if p.get("asset") == token_id:
+                    cur_price = p.get("cur_price")
+                    break
+            edge_pp = ((new_q - cur_price) * 100) if cur_price else None
+            
+            return jsonify({
+                "ok": True,
+                "monitor_state": new_state,
+                "edge_pp": edge_pp,
+                "new_q": new_q,
+                "old_q": old_q,
+                "message": f"q 已更新: {old_q:.3f} -> {new_q:.3f} | 状态: {new_state}"
+            })
+        except Exception as e:
+            log.exception(f"update_q error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/reeval_prompt")
+    def reeval_prompt_route():
+        """生成某仓位的重评 prompt"""
+        from modules.db import get_position_meta
+        from modules.prompts import build_reeval_prompt
+        from datetime import datetime, timezone
+        token_id = flask_request.args.get("token_id", "")
+        if not token_id:
+            return jsonify({"ok": False, "message": "缺少 token_id"})
+        meta = get_position_meta(token_id)
+        if not meta:
+            return jsonify({"ok": False, "message": "找不到该仓位元数据"})
+        # 拉当前价
+        try:
+            exe = Executor.get()
+            positions = exe.get_positions()
+            cur_price = None
+            live_avg = 0
+            for p in positions:
+                if p.get("asset") == token_id:
+                    cur_price = p.get("cur_price") or 0
+                    live_avg = p.get("avg_price") or 0
+                    break
+            if cur_price is None:
+                return jsonify({"ok": False, "message": "找不到该仓位的当前价"})
+            # Self-heal: 如果 meta.entry_price 为 0 但 Polymarket 实时 avg_price 有值, 写回 DB
+            db_entry = float(meta.get("entry_price") or 0)
+            if db_entry == 0 and live_avg and live_avg > 0:
+                from modules.db import update_entry_price
+                update_entry_price(token_id, live_avg)
+                meta["entry_price"] = live_avg
+                log.info(f"healed entry_price for {token_id[:20]} → ${live_avg:.4f}")
+            
+            # 距结算天数
+            end_date = meta.get("end_date") or ""
+            days_left = 0
+            if end_date:
+                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                if end_dt.tzinfo is None: end_dt = end_dt.replace(tzinfo=timezone.utc)  # v6.0.1 修: naive 当 UTC, 防 days_left 减法崩 (reeval_prompt 500)
+                days_left = (end_dt - datetime.now(timezone.utc)).days
+            
+            # 进度
+            entry = meta.get("entry_price") or 0
+            tp = meta.get("new_tp") or meta.get("tp") or 0
+            gap = tp - entry
+            progress = max(0.0, min(1.0, (cur_price - entry) / gap)) if gap > 0 else 0
+            
+            # v4.1: 反查 Gamma 拿真实 question (而不是 slug)
+            # v5.2: 同时拉 description (Resolution 规则全文) 嵌进 prompt
+            try:
+                import requests as _req
+                gr = _req.get("https://gamma-api.polymarket.com/markets",
+                              params={"clob_token_ids": token_id, "limit": 1},
+                              timeout=8).json()
+                if gr and isinstance(gr, list) and len(gr) > 0:
+                    m_data = gr[0]
+                    q_text = m_data.get("question", "") or ""
+                    desc_text = m_data.get("description", "") or ""
+                    if q_text:
+                        meta["_market_question"] = q_text
+                    if desc_text:
+                        meta["_market_description"] = desc_text
+            except Exception:
+                pass
+            
+            prompt = build_reeval_prompt(meta, cur_price, days_left, progress)
+            return jsonify({"ok": True, "prompt": prompt, 
+                            "market_slug": meta.get("market_slug", ""),
+                            "tp": tp, "cur_price": cur_price})
+        except Exception as e:
+            log.exception(f"reeval_prompt error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/mark_reeval", methods=["POST"])
+    def mark_reeval_route():
+        """标记重评结果. body: {token_id, action: uplift|skip|close, new_tp?}"""
+        from modules.db import mark_reeval, log_event
+        data = flask_request.get_json() or {}
+        token_id = data.get("token_id", "")
+        action = data.get("action", "")
+        new_tp = data.get("new_tp")
+        if not token_id or action not in ("uplift", "skip", "close"):
+            return jsonify({"ok": False, "message": "参数错误"})
+        if action == "uplift":
+            if new_tp is None:
+                return jsonify({"ok": False, "message": "uplift 必须提供 new_tp"})
+            try:
+                new_tp = float(new_tp)
+                if not (0 < new_tp < 1):
+                    return jsonify({"ok": False, "message": "new_tp 必须是 0-1 之间的小数"})
+            except Exception:
+                return jsonify({"ok": False, "message": "new_tp 格式错误"})
+        ok = mark_reeval(token_id, action, new_tp=new_tp if action == "uplift" else None)
+        if ok:
+            log_event("reeval", token_id[:20], f"action={action} new_tp={new_tp}")
+            msg_map = {
+                "uplift": f"已上调 TP 到 {new_tp*100:.1f}%",
+                "skip": "已跳过重评 (维持原 TP)",
+                "close": "已标记重评清仓 (请去 Polymarket 网页手动卖出)"
+            }
+            return jsonify({"ok": True, "message": msg_map[action]})
+        return jsonify({"ok": False, "message": "标记失败"})
+
+    @app.route("/api/record_position", methods=["POST"])
+    def record_position():
+        from modules.db import save_position_meta
+        data = flask_request.get_json() or {}
+        try:
+            entry_price = float(data["entry_price"])
+            tp = float(data["tp"])
+            side = data.get("side","YES")
+            # 兜底: 前端传 entry_price=0 (polymarket avg API 还没算好等场景)
+            # → server 实时从 polymarket 拉 avgPrice 兜底. 防止 entry=0 污染 db.
+            if entry_price <= 0:
+                token_id = data.get("token_id", "")
+                try:
+                    exe = Executor.get()
+                    for p in exe.get_positions():
+                        if p.get("asset") == token_id:
+                            live_avg = float(p.get("avg_price") or 0)
+                            if live_avg > 0:
+                                entry_price = live_avg
+                                log.warning(f"healed entry_price=0 for {token_id[:20]} → ${entry_price:.4f} (polymarket avg)")
+                            break
+                except Exception as e:
+                    log.warning(f"entry_price heal failed: {e}")
+                if entry_price <= 0:
+                    return jsonify({"ok": False, "message": "❌ entry_price=0 且无法从 polymarket 拉到 avg, 请刷新页面重试"})
+            # Sanity check: TP必须高于持仓token买入价 (持有token涨=赚钱)
+            if tp <= entry_price:
+                return jsonify({
+                    "ok": False,
+                    "message": f"❌ TP方向错误! 你的{side}仓位买入价是{entry_price*100:.1f}%, "
+                               f"TP({tp*100:.1f}%)必须>买入价。"
+                               f"提醒: TP填的是你持仓token的目标价 (买NO就填NO的目标价)"
+                })
+            if tp >= 1.0:
+                return jsonify({"ok": False, "message": "TP不能>=100%"})
+                        # v4.1 防御: slug 或 end_date 为空时, 服务端反查 Gamma
+            if not data.get("slug") or not data.get("end_date"):
+                try:
+                    import requests as _req
+                    r = _req.get("https://gamma-api.polymarket.com/markets",
+                                 params={"clob_token_ids": data["token_id"], "limit": 1},
+                                 timeout=8).json()
+                    if r and isinstance(r, list) and len(r) > 0:
+                        m = r[0]
+                        if not data.get("slug"):
+                            data["slug"] = m.get("slug", "") or ""
+                        if not data.get("end_date"):
+                            data["end_date"] = m.get("endDate", "") or ""
+                except Exception:
+                    pass  # gamma_lookup 失败也不阻塞保存
+            
+            # 校验 stop_loss_tier (可选)
+            stop_loss_tier = data.get("stop_loss_tier") or None
+            if stop_loss_tier and stop_loss_tier not in ("convergent", "hybrid", "event_driven"):
+                return jsonify({"ok": False, "message": f"❌ 止损档无效: {stop_loss_tier} (允许: convergent/hybrid/event_driven)"})
+            # v5.7 (P9): defensive numeric validation — reject obviously bad inputs
+            if not (0 < tp < 1):
+                return jsonify({"ok": False, "message": f"❌ tp 范围错: {tp} (需 0-1)"})
+            if not (0 < entry_price < 1):
+                return jsonify({"ok": False, "message": f"❌ entry_price 范围错: {entry_price} (需 0-1)"})
+            _size_raw = float(data.get("size", 0))
+            if _size_raw < 0 or _size_raw > 100000:
+                return jsonify({"ok": False, "message": f"❌ size 不合理: {_size_raw}"})
+            # v5.7 (P8): entry_reason fallback — stub so column not永远 NULL.
+            # User-supplied reason from request takes precedence; otherwise generate minimal trace.
+            entry_reason_raw = (data.get("entry_reason") or "").strip()[:2000]
+            if not entry_reason_raw:
+                from datetime import datetime, timezone
+                _now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                _conf = data.get("original_confidence") or "?"
+                _tier = stop_loss_tier or "(legacy)"
+                entry_reason_raw = f"[auto-stub {_now}] tp={tp:.3f} conf={_conf} tier={_tier} — user did not provide reason"
+            # v5.7 (P6): snapshot claude_raw_estimate = tp at entry. Frozen across future re-evals so
+            # calibration check can compare original LLM estimate vs final resolution.
+            # v5.9: accept cluster_id + size_usd_suggested (both optional, can be backfilled later via /api/update_cluster)
+            cluster_id = (data.get("cluster_id") or "").strip() or None
+            if cluster_id and "-" not in cluster_id:
+                return jsonify({"ok": False, "message": "❌ cluster_id 格式错: 必须含 '-' (topic-direction)"})
+            size_usd_suggested_raw = data.get("size_usd_suggested")
+            try:
+                size_usd_suggested = float(size_usd_suggested_raw) if size_usd_suggested_raw not in (None, "") else None
+            except (ValueError, TypeError):
+                size_usd_suggested = None
+            # v5.10: tag 入场时记一次, 卖出时 monitor / force_exit / execute_state 从 meta 复制到 closed_positions.
+            # tag 由扫描器命中的 polymarket 标签 (Iran / Politics / Crypto ...) 决定. 用户在 dashboard 录入时自动从扫描结果带入.
+            tag_raw = (data.get("tag") or "").strip() or None
+            save_position_meta(
+                token_id=data["token_id"],
+                market_slug=data.get("slug",""),
+                side=side,
+                entry_price=entry_price,
+                tp=tp,
+                end_date=data.get("end_date",""),
+                initial_size=_size_raw,
+                notes=data.get("notes",""),
+                entry_reason=entry_reason_raw,
+                claude_raw_estimate=tp,
+                original_confidence=(data.get("original_confidence") or None),
+                stop_loss_tier=stop_loss_tier,
+                cluster_id=cluster_id,
+                size_usd_suggested=size_usd_suggested,
+                tag=tag_raw,
+            )
+            return jsonify({"ok":True,"message":"持仓元数据已记录"})
+        except Exception as e:
+            return jsonify({"ok":False,"message":str(e)})
+
+    @app.route("/api/update_confidence", methods=["POST"])
+    def update_confidence_api():
+        from modules.db import update_confidence
+        data = flask_request.get_json() or {}
+        token_id = data.get("token_id")
+        confidence = data.get("confidence") or None
+        if not token_id:
+            return jsonify({"ok": False, "message": "missing token_id"})
+        if confidence and confidence not in ("high", "medium", "low"):
+            return jsonify({"ok": False, "message": "invalid confidence value"})
+        rows = update_confidence(token_id, confidence)
+        return jsonify({"ok": True, "rows": rows})
+
+    @app.route("/api/update_tier", methods=["POST"])
+    def update_tier_api():
+        from modules.db import update_stop_loss_tier
+        data = flask_request.get_json() or {}
+        token_id = data.get("token_id")
+        tier = data.get("stop_loss_tier") or None
+        if not token_id:
+            return jsonify({"ok": False, "message": "missing token_id"})
+        if tier and tier not in ("convergent", "hybrid", "event_driven"):
+            return jsonify({"ok": False, "message": "invalid tier value"})
+        rows = update_stop_loss_tier(token_id, tier)
+        return jsonify({"ok": True, "rows": rows})
+
+    @app.route("/api/toggle_take_profit", methods=["POST"])
+    def toggle_take_profit_api():
+        """v5.10.1: 切换某仓位是否禁用自动止盈.
+        body: {token_id, disabled: 0 or 1}
+        效果: monitor 跳过 TAKE_PROFIT_PRICE + TAKE_PROFIT_PNL 两条规则.
+        止损/TIME_STOP/edge-based 仍按规则跑."""
+        from modules.db import set_disable_take_profit, log_event, get_position_meta
+        data = flask_request.get_json() or {}
+        token_id = data.get("token_id")
+        if not token_id:
+            return jsonify({"ok": False, "message": "missing token_id"})
+        try:
+            disabled = int(data.get("disabled", 0))
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "message": "disabled must be 0 or 1"})
+        if disabled not in (0, 1):
+            return jsonify({"ok": False, "message": "disabled must be 0 or 1"})
+        rows = set_disable_take_profit(token_id, disabled)
+        if rows == 0:
+            return jsonify({"ok": False, "message": "token_id 不在 position_meta (没仓位记录)"})
+        meta = get_position_meta(token_id) or {}
+        slug = meta.get("market_slug") or ""
+        log_event(
+            "user_action",
+            slug,
+            f"toggle_take_profit disabled={disabled}",
+        )
+        return jsonify({
+            "ok": True,
+            "rows": rows,
+            "disabled": disabled,
+            "message": "🚫 已关闭自动止盈, 此仓位将不会触发 90¢/+100% 止盈" if disabled else "🔔 已恢复自动止盈",
+        })
+
+    @app.route("/api/toggle_auto_stop", methods=["POST"])
+    def toggle_auto_stop_api():
+        """v5.16: 切换某仓是否关闭"全部自动止损".
+        body: {token_id, disabled: 0 or 1}
+        效果: disabled=1 → monitor 跳过 %止损线 (_evaluate_position) + 不触发亏损自动重评
+        (_maybe_trigger_auto_reeval), 只留 $0.05 地板兜底防真归零. TIME_STOP / 止盈 不受影响.
+        disabled=0 → 恢复. 复用 v5.14 cancel_autostop 的 autostop_disabled 标志."""
+        from modules.db import set_autostop_disabled, log_event, get_position_meta
+        data = flask_request.get_json() or {}
+        token_id = data.get("token_id")
+        if not token_id:
+            return jsonify({"ok": False, "message": "missing token_id"})
+        try:
+            disabled = int(data.get("disabled", 0))
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "message": "disabled must be 0 or 1"})
+        if disabled not in (0, 1):
+            return jsonify({"ok": False, "message": "disabled must be 0 or 1"})
+        rows = set_autostop_disabled(token_id, bool(disabled))
+        if rows == 0:
+            return jsonify({"ok": False, "message": "token_id 不在 position_meta (没仓位记录)"})
+        meta = get_position_meta(token_id) or {}
+        slug = meta.get("market_slug") or ""
+        log_event("user_action", slug, f"toggle_auto_stop disabled={disabled}")
+        return jsonify({
+            "ok": True,
+            "rows": rows,
+            "disabled": disabled,
+            "message": "🛑 已关闭此仓全部自动止损 (只留 $0.05 地板兜底)" if disabled else "🛡 已恢复此仓自动止损",
+        })
+
+    @app.route("/api/update_tp", methods=["POST"])
+    def update_tp_api():
+        from modules.db import update_tp, get_position_meta
+        data = flask_request.get_json() or {}
+        try:
+            new_tp = float(data["new_tp"])
+            token_id = data["token_id"]
+            meta = get_position_meta(token_id)
+            if meta:
+                entry_price = meta.get("entry_price")
+                if entry_price and new_tp <= entry_price:
+                    return jsonify({
+                        "ok": False,
+                        "message": f"❌ TP方向错误! 持仓买入价{entry_price*100:.1f}%, "
+                                   f"TP({new_tp*100:.1f}%)必须>买入价"
+                    })
+            if new_tp >= 1.0 or new_tp <= 0:  # v5.7 (P9): also reject ≤0
+                return jsonify({"ok": False, "message": "TP 必须在 (0, 1) 之间"})
+            update_tp(token_id, new_tp)
+            return jsonify({"ok":True,"message":"tp已更新"})
+        except Exception as e:
+            return jsonify({"ok":False,"message":str(e)})
+
+    @app.route("/api/full_prompt")
+    def full_prompt():
+        """v5.8: 返回 Prompt + 扫描报告. 接 ?tag=<label> 用 cached 单 tag 报告; 默认 last_scan.md.
+        v5.9: 自动 prepend 当前 cluster 字典, Claude 看到字典会复用现有 slug 而不是创新名."""
+        try:
+            tag = (flask_request.args.get("tag") or "").strip()
+            scan_content = None
+            if tag:
+                from modules.scanner import get_cached_report
+                scan_content = get_cached_report(tag)
+                if scan_content is None:
+                    return jsonify({"ok": False, "message": f"tag '{tag}' 还未 cached, 先扫"})
+            else:
+                try:
+                    with open("last_scan.md", "r") as f:
+                        scan_content = f.read()
+                except:
+                    scan_content = "(请先用扫描器生成候选市场列表)"
+            # v5.9: 取 cluster 字典 prepend 到 DISCOVERY prompt 顶部
+            try:
+                from modules.clusters import get_cluster_dict_for_prompt
+                cluster_md = get_cluster_dict_for_prompt()
+            except Exception as e:
+                log.warning(f"get_cluster_dict_for_prompt failed: {e}")
+                cluster_md = ""
+            base = DISCOVERY_PROMPT.replace("{positions_list}", scan_content)
+            # v5.9 (2026-06-03): Deep Research 默认英文输出, 在 prompt 最顶部加超强中文强制
+            lang_lock = (
+                "# 🇨🇳 输出语言强制要求 (LANGUAGE LOCK)\n\n"
+                "**整个回复必须用简体中文** — 包括所有分析段落、表格、最终推荐卡片.\n"
+                "英文专有名词 (公司名 / 人名 / slug / URL) 可保留, 其他英文文字一律视为违反契约, 必须重写.\n"
+                "Deep Research 即使用英文搜索, 综合输出也必须翻译成中文呈现给我.\n\n"
+                "**MANDATORY: Reply in Simplified Chinese throughout, regardless of search language. "
+                "Any English narrative is a violation — rewrite the whole thing in Chinese.**\n\n"
+                "---\n\n"
+            )
+            if cluster_md:
+                full = lang_lock + cluster_md + "\n\n---\n\n" + base
+            else:
+                full = lang_lock + base
+            return jsonify({"ok": True, "prompt": full, "tag": tag or None})
+        except Exception as e:
+            log.exception(f"full_prompt error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/closed_positions")
+    def closed_positions():
+        """已卖出仓位 + 卖后价格走势. range = 1w / 1m. 跳过已结算到 0/1 的市场."""
+        from datetime import datetime, timezone, timedelta
+        from collections import defaultdict
+        import os, json as J, time
+        try:
+            rng = (flask_request.args.get("range") or "1w").lower()
+            if rng == "all":
+                since_ts = 0  # 不限时间, 拉全部历史
+            else:
+                days = 7 if rng == "1w" else 30
+                since_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+
+            wallet = os.getenv("POLY_FUNDER")
+            if not wallet:
+                return jsonify({"ok": False, "message": "POLY_FUNDER not set"})
+
+            import requests as _req
+            # 1. 拉 trades
+            trades = []
+            offset = 0
+            while True:
+                r = _req.get("https://data-api.polymarket.com/activity",
+                             params={"user": wallet, "limit": 500, "offset": offset, "type": "TRADE"},
+                             timeout=20).json()
+                if not r: break
+                trades.extend(r)
+                if len(r) < 500: break
+                offset += 500
+                if offset > 2000: break  # safety
+            trades_in_range = [t for t in trades if t["timestamp"] >= since_ts]
+
+            # 2. 按 asset 分组. 同时记每个 asset 的全部 trades (包括 range 外, 用于 round 入场均价)
+            asset_meta = {}
+            sells_by_asset = defaultdict(list)
+            all_trades_by_asset = defaultdict(list)
+            for t in trades:  # 全部 trades, 不只 range 内
+                asset_meta[t["asset"]] = (t["title"], t["conditionId"])
+                all_trades_by_asset[t["asset"]].append(t)
+            for t in trades_in_range:
+                if t["side"] == "SELL":
+                    sells_by_asset[t["asset"]].append(t)
+            if not sells_by_asset:
+                return jsonify({"ok": True, "rows": []})
+
+            # 2b. 查 db.events 拿每个 sell 的触发类型 (auto_sell/user_sell detail 含 STATE)
+            import sqlite3 as _sql
+            from modules.db import DB_PATH as _DB_PATH
+            db_conn = _sql.connect(_DB_PATH)
+            db_events = db_conn.execute("SELECT timestamp, market_slug, detail FROM events WHERE event_type IN ('auto_sell','user_sell') AND timestamp >= ?", ("2026-04-01",)).fetchall()
+            db_conn.close()
+            # 索引: title → list[(ts, detail)]
+            db_by_title = defaultdict(list)
+            for ts_str, slug, detail in db_events:
+                try:
+                    db_dt = datetime.fromisoformat(ts_str)
+                    # log_event 写入用的是 datetime.now() (local time, naive). Python
+                    # naive datetime.timestamp() 默认按 system local tz 转 unix, 跟
+                    # polymarket trade.timestamp (unix UTC) 自然对齐.
+                    db_by_title[slug].append((db_dt.timestamp(), detail))
+                except Exception: pass
+            def detect_trigger(title, trade_ts):
+                """找 trade 时间 ±120s 内 db 最近的 sell event, 返回 (label, raw_state)"""
+                cands = db_by_title.get(title, [])
+                if not cands: return None
+                best = None; best_diff = 999
+                for db_ts, detail in cands:
+                    d = abs(db_ts - trade_ts)
+                    if d < best_diff: best_diff = d; best = detail
+                if best is None or best_diff > 300: return None
+                state = best.split(" ")[0] if best else ""
+                label_map = {
+                    "TAKE_PROFIT_PRICE": "📈 价格止盈",
+                    "TAKE_PROFIT_PNL":   "📈 浮盈翻倍",
+                    "STOP_LOSS":         "📉 自动止损",
+                    "TIME_STOP":         "⏰ 临结算锁定",
+                    "FORCE_EXIT":        "✗ 手动清仓",
+                    "AT_TARGET":         "🎯 到目标",
+                    "DISASTER":          "💥 灾难止损 (v4)",
+                    "FROZEN_EXPIRED":    "❄️ 冻结到期 (v5)",
+                }
+                return label_map.get(state, state)
+
+            # 3. batch gamma-api 拉 current prices
+            cond_ids = list({asset_meta[a][1] for a in sells_by_asset})
+            markets = {}
+            for i in range(0, len(cond_ids), 20):
+                batch = cond_ids[i:i+20]
+                params = [("condition_ids", c) for c in batch]
+                try:
+                    r = _req.get("https://gamma-api.polymarket.com/markets", params=params, timeout=20).json()
+                    for m in r:
+                        markets[m["conditionId"]] = m
+                except Exception:
+                    pass
+
+            # 4. 每个 asset 一行, 行内含 sells 数组 (按时间倒序, 最新在前)
+            rows = []
+            for asset, sells in sells_by_asset.items():
+                title, cond = asset_meta[asset]
+                m = markets.get(cond, {})
+                cur_price = None; closed = False
+                try:
+                    ctids = J.loads(m.get("clobTokenIds", "[]"))
+                    prices = J.loads(m.get("outcomePrices", "[]"))
+                    if asset in ctids:
+                        cur_price = float(prices[ctids.index(asset)])
+                    closed = bool(m.get("closed"))
+                except Exception:
+                    pass
+                if cur_price is None: continue
+                if closed or cur_price >= 0.98 or cur_price <= 0.02:
+                    continue
+                # 把该 asset 全部 trades (无论 range) 按 round 切分,
+                # 一个 round = 累计 BUY 后跟一组 SELL 直到 size 清零 (再次买入开新 round)
+                all_t = sorted(all_trades_by_asset[asset], key=lambda x: x["timestamp"])
+                rounds = []
+                cur_round = {"buys": [], "sells": []}
+                cur_sz = 0.0
+                for tr in all_t:
+                    if tr["side"] == "BUY":
+                        if cur_round["sells"] and cur_sz < 0.01:
+                            rounds.append(cur_round)
+                            cur_round = {"buys": [], "sells": []}
+                        cur_round["buys"].append(tr)
+                        cur_sz += tr["size"]
+                    else:
+                        cur_round["sells"].append(tr)
+                        cur_sz -= tr["size"]
+                if cur_round["buys"] or cur_round["sells"]:
+                    rounds.append(cur_round)
+                # 找每个 sell 属于哪个 round → 算 round 入场均价
+                def find_round(sell_t):
+                    for r in rounds:
+                        if any(s["timestamp"] == sell_t["timestamp"] for s in r["sells"]):
+                            return r
+                    return None
+
+                sells_sorted = sorted(sells, key=lambda s: s["timestamp"], reverse=True)
+                n = len(sells_sorted)
+                sell_cards = []
+                for idx, t in enumerate(sells_sorted):
+                    seq = n - idx
+                    rnd = find_round(t)
+                    entry_avg = None; first_buy_ts = None
+                    if rnd and rnd["buys"]:
+                        bcost = sum(b["usdcSize"] for b in rnd["buys"])
+                        bsize = sum(b["size"] for b in rnd["buys"])
+                        if bsize > 0:
+                            entry_avg = bcost / bsize
+                        first_buy_ts = min(b["timestamp"] for b in rnd["buys"])
+                    cost = (entry_avg * float(t["size"])) if entry_avg else None
+                    pnl = (float(t["usdcSize"]) - cost) if cost is not None else None
+                    roi = (pnl / cost * 100) if (cost and cost > 0) else None
+                    # 持仓时长
+                    duration = None
+                    if first_buy_ts:
+                        secs = t["timestamp"] - first_buy_ts
+                        d, rem = divmod(secs, 86400)
+                        h = rem // 3600
+                        duration = f"{int(d)}天{int(h)}小时" if d > 0 else f"{int(h)}小时{int((rem%3600)//60)}分"
+                    trigger = detect_trigger(title, t["timestamp"])
+                    sell_cards.append({
+                        "seq": seq,
+                        "date": datetime.fromtimestamp(t["timestamp"], tz=timezone.utc).strftime("%m-%d %H:%M"),
+                        "size": round(float(t["size"]), 4),
+                        "price": round(float(t["price"]), 4),
+                        "revenue": round(float(t["usdcSize"]), 4),
+                        "entry_avg": round(entry_avg, 4) if entry_avg else None,
+                        "cost": round(cost, 4) if cost is not None else None,
+                        "pnl": round(pnl, 4) if pnl is not None else None,
+                        "roi": round(roi, 2) if roi is not None else None,
+                        "duration": duration,
+                        "trigger": trigger,
+                        "change_pp": round((cur_price - float(t["price"])) * 100, 2),
+                    })
+                latest_ts = sells_sorted[0]["timestamp"]
+                rows.append({
+                    "title": title,
+                    "latest_sell_ts": latest_ts,
+                    "latest_sell_date": datetime.fromtimestamp(latest_ts, tz=timezone.utc).strftime("%m-%d %H:%M"),
+                    "cur_price": round(cur_price, 4),
+                    "sells": sell_cards,
+                    "sell_count": n,
+                })
+            rows.sort(key=lambda r: r["latest_sell_ts"], reverse=True)
+            return jsonify({"ok": True, "rows": rows})
+        except Exception as e:
+            log.exception(f"closed_positions error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/scan_report")
+    def scan_report():
+        """v5.8: 接 ?tag=<label> 返回该 tag 的 cached 报告 (data/scan_reports/<slug>.md); 否则 last_scan.md."""
+        import os
+        try:
+            tag = (flask_request.args.get("tag") or "").strip()
+            if tag:
+                from modules.scanner import get_cached_report, _slugify_tag
+                report = get_cached_report(tag)
+                if report is None:
+                    return jsonify({"ok": False, "report": f"tag '{tag}' 还未 cached", "mtime": 0})
+                slug = _slugify_tag(tag)
+                path = f"data/scan_reports/{slug}.md"
+                mtime = os.path.getmtime(path) if os.path.exists(path) else 0
+                return jsonify({"ok": True, "report": report, "mtime": mtime, "tag": tag})
+            mtime = os.path.getmtime("last_scan.md")
+            with open("last_scan.md", "r") as f:
+                return jsonify({"ok":True, "report": f.read(), "mtime": mtime})
+        except:
+            return jsonify({"ok":False, "report": "暂无扫描报告。点击扫描按钮开始。", "mtime": 0})
+
+    # ============================================================
+    # v5.8: 一键全扫 (scan_all_tags) — 触发 + 状态查询
+    # ============================================================
+    @app.route("/api/scan_all", methods=["POST"])
+    def scan_all_route():
+        """v5.8: 触发全扫 Tier 1+2 (27 tag). 后台跑, 立刻返回. 进度走 /api/scan_all_status."""
+        import threading, time
+        from modules.scanner import scan_all_tags
+        data = flask_request.get_json() or {}
+        tier_filter = tuple(data.get("tiers") or (1, 2))
+        mode = data.get("mode") or "standard"
+        def _bg():
+            try:
+                scan_all_tags(tier_filter=tier_filter, mode=mode, tag_workers=5)
+            except Exception as e:
+                log.exception(f"scan_all background failed: {e}")
+        threading.Thread(target=_bg, daemon=True).start()
+        return jsonify({"ok": True, "started_at": time.time(),
+                        "tiers": list(tier_filter), "mode": mode,
+                        "message": f"Tier {tier_filter} 全扫已启动 (后台跑约 2-3 分钟)"})
+
+    @app.route("/api/scan_all_status")
+    def scan_all_status_route():
+        """v5.8: 返回 manifest 内容. 前端轮询用."""
+        from modules.scanner import _read_manifest
+        m = _read_manifest()
+        # 汇总统计
+        total = len(m)
+        done = sum(1 for v in m.values() if v.get("status") == "done")
+        running = sum(1 for v in m.values() if v.get("status") == "running")
+        pending = sum(1 for v in m.values() if v.get("status") == "pending")
+        error = sum(1 for v in m.values() if v.get("status") == "error")
+        return jsonify({"ok": True, "manifest": m,
+                        "summary": {"total": total, "done": done,
+                                    "running": running, "pending": pending, "error": error}})
+
+    @app.route("/api/client_log", methods=["POST"])
+    def client_log_route():
+        """v5.9 诊断: 前端把 JS error 回传, server 写 bot.log 给开发者看."""
+        try:
+            data = flask_request.get_json() or {}
+            where = (data.get("where") or "?")[:50]
+            url = (data.get("url") or "")[:200]
+            err = (data.get("err") or "")[:200]
+            stack = (data.get("stack") or "")[:500]
+            log.error(f"[client_log] where={where} err={err} url={url}")
+            if stack:
+                log.error(f"[client_log] stack: {stack}")
+            return jsonify({"ok": True})
+        except Exception as e:
+            log.warning(f"client_log handler error: {e}")
+            return jsonify({"ok": False}), 200
+
+    @app.route("/api/logs")
+    def api_logs():
+        try:
+            r = subprocess.run(["tail","-80","bot.log"],capture_output=True,text=True,timeout=5)
+            lines = r.stdout.strip().split("\n") if r.stdout else []
+            filtered = [l for l in lines if "/api/" not in l and "GET / " not in l]
+            return jsonify({"ok":True,"lines":filtered[-40:]})
+        except:
+            return jsonify({"ok":False,"lines":[]})
+
+    @app.route("/api/system_events")
+    def api_system_events():
+        """v5.13: 总控台「卖出事件」数据源 (只读, 给 /panel 中列下半区用).
+        只返回 events 表里的 auto_sell / user_sell, 按时间倒序最新 N 条 (默认 12).
+        注: 用户口径"系统事件"=卖出事件; 不含 bug/错误 (那些去主页日志区看, 不放面板)."""
+        from modules.db import _parse_iso_to_aware
+        try:
+            limit = int(flask_request.args.get("limit", "12"))
+        except (ValueError, TypeError):
+            limit = 12
+        limit = max(1, min(limit, 40))
+        items = []
+        try:
+            for e in get_recent_events(150):
+                et = e.get("event_type")
+                if et not in ("auto_sell", "user_sell"):
+                    continue
+                dt = _parse_iso_to_aware(e.get("timestamp"))
+                tdisp = dt.astimezone().strftime("%m-%d %H:%M") if dt else ""
+                items.append({
+                    "kind": et,
+                    "label": "自动卖出" if et == "auto_sell" else "手动卖出",
+                    "title": (e.get("market_slug") or "").strip(),
+                    "detail": (e.get("detail") or "").strip(),
+                    "time": tdisp,
+                })
+                if len(items) >= limit:
+                    break
+        except Exception as _e:
+            log.warning(f"system_events failed: {_e}")
+        return jsonify({"ok": True, "items": items})
+
+    # ============================================================
+    # v5.9: position sizing formula routes
+    # ============================================================
+    @app.route("/api/suggested_size")
+    def suggested_size_route():
+        """v5.9: 给前端 "入场金额建议" 面板实时调.
+        query: q, p, confidence, tier, days, cluster (kebab-case slug).
+        返回: { ok, size_usd, reason, bankroll_usd, cluster_exposure_usd, cluster_cap_usd, exposed_dd_usd }
+        """
+        from modules.sizing import position_size_usd, SIZING_CFG, _cfg
+        from modules.clusters import cluster_exposure_usd, portfolio_exposed_dd_usd, bankroll_usd
+        try:
+            q = float(flask_request.args.get("q", "0"))
+            p = float(flask_request.args.get("p", "0"))
+            conf = flask_request.args.get("confidence", "medium")
+            tier = flask_request.args.get("tier", "hybrid")
+            days = int(flask_request.args.get("days", "30"))
+            cluster_id = (flask_request.args.get("cluster") or "").strip() or None
+
+            br = bankroll_usd()
+            if br is None:
+                return jsonify({"ok": False, "message": "cash API failed (bankroll unknown)"})
+            cluster_cap = br * _cfg("CLUSTER_CAP_PCT")
+            cluster_exp = cluster_exposure_usd(cluster_id) if cluster_id else 0.0
+            dd_exp = portfolio_exposed_dd_usd()
+
+            size, reason = position_size_usd(
+                q=q, p=p, confidence=conf, stop_loss_tier=tier,
+                days_to_resolution=days, bankroll_usd=br,
+                cluster_current_exposure_usd=cluster_exp,
+                cluster_cap_usd=cluster_cap,
+                exposed_dd_usd=dd_exp,
+            )
+            return jsonify({
+                "ok": True,
+                "size_usd": size,
+                "reason": reason,
+                "bankroll_usd": round(br, 2),
+                "cluster_id": cluster_id,
+                "cluster_exposure_usd": round(cluster_exp, 2),
+                "cluster_cap_usd": round(cluster_cap, 2),
+                "exposed_dd_usd": round(dd_exp, 2),
+                "dd_budget_remaining_usd": round(_cfg("MONTHLY_DD_BUDGET") - dd_exp, 2),
+            })
+        except (ValueError, TypeError) as e:
+            return jsonify({"ok": False, "message": f"input parse error: {e}"})
+        except Exception as e:
+            log.exception(f"suggested_size error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/update_cluster", methods=["POST"])
+    def update_cluster_route():
+        """v5.9: 用户在 Cluster 分析 tab 填好 cluster_id 后保存. body: {token_id, cluster_id}."""
+        from modules.db import get_conn
+        from modules.clusters import cluster_exposure_usd
+        try:
+            data = flask_request.get_json() or {}
+            token_id = (data.get("token_id") or "").strip()
+            cluster_id = (data.get("cluster_id") or "").strip()
+            if not token_id:
+                return jsonify({"ok": False, "message": "missing token_id"})
+            # cluster_id 可以为空 (清除分类) 或非空 kebab-case
+            if cluster_id and not all(c.islower() or c.isdigit() or c == "-" for c in cluster_id):
+                return jsonify({"ok": False, "message": "cluster_id must be lowercase kebab-case (a-z 0-9 -)"})
+            if cluster_id and "-" not in cluster_id:
+                return jsonify({"ok": False, "message": "cluster_id must contain at least one '-' (format: topic-direction)"})
+            conn = get_conn()
+            conn.execute("UPDATE position_meta SET cluster_id=? WHERE token_id=?",
+                         (cluster_id or None, token_id))
+            conn.commit(); conn.close()
+            # 返回该 cluster 的新 exposure
+            new_exp = cluster_exposure_usd(cluster_id) if cluster_id else 0.0
+            return jsonify({"ok": True, "cluster_id": cluster_id or None,
+                            "new_cluster_exposure_usd": round(new_exp, 2)})
+        except Exception as e:
+            log.exception(f"update_cluster error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/list_clusters")
+    def list_clusters_route():
+        """v5.9: 给 Cluster 分析 tab + 入场金额建议 dropdown 用."""
+        from modules.clusters import list_active_clusters
+        try:
+            data = list_active_clusters()
+            return jsonify({"ok": True, "clusters": [
+                {"cluster_id": cid, "exposure_usd": round(exp, 2), "count": cnt}
+                for cid, exp, cnt in data
+            ]})
+        except Exception as e:
+            log.exception(f"list_clusters error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    # ===========================================================================
+    # v5.10: /history page API routes
+    # ===========================================================================
+    def _batch_cur_prices(token_ids):
+        """v5.10: batch 拉 token cur_price (用于 in_progress sell_change_pp).
+        失败的 token 返回 None. Polymarket gamma 一次最多~20 个 token_id 比较稳.
+        v5.10.2: 改用 gamma_client.gamma_get (本机 DNS 污染时自动 DoH 固定 IP 兜底)."""
+        if not token_ids:
+            return {}
+        from modules.gamma_client import gamma_get
+        prices = {}
+        # 1) 先 batch 拉 markets 拿 outcomePrices + clobTokenIds, 用 token_id index 取价
+        for i in range(0, len(token_ids), 20):
+            batch = token_ids[i:i+20]
+            params = [("clob_token_ids", t) for t in batch]
+            try:
+                r = gamma_get("/markets", params, timeout=12)
+                for m in (r or []):
+                    try:
+                        ctids = json.loads(m.get("clobTokenIds", "[]"))
+                        outp = [float(p) for p in json.loads(m.get("outcomePrices", "[]"))]
+                        for t in batch:
+                            if t in ctids and t not in prices:
+                                prices[t] = outp[ctids.index(t)]
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"_batch_cur_prices batch fail: {e}")
+        return prices
+
+    def _group_closed_rows_into_cards(rows, include_cur_price=False, include_resolution=False):
+        """v5.10.1: 把 closed_positions 的 row[] 按 token_id 分组, 每组装成一个仓位 card,
+        含 sells[] (round-as-sell 排列, 按 exit_at 倒序). 跟老 /api/closed_positions sell-card 兼容.
+        每个 sell 字段: seq / date / size / price (= exit_price) / revenue / entry_avg /
+                       cost / pnl / roi / duration / trigger / change_pp.
+        Resolution 路径多 final_outcome + is_correct + resolved_at."""
+        from collections import defaultdict
+        from datetime import datetime, timezone
+        groups = defaultdict(list)
+        for r in rows:
+            groups[r["token_id"]].append(r)
+        cur = {}
+        if include_cur_price:
+            cur = _batch_cur_prices(list(groups.keys()))
+
+        cards = []
+        for token_id, sub in groups.items():
+            sub = sorted(sub, key=lambda x: x.get("exit_at") or "", reverse=True)
+            head = sub[0]
+            cp = cur.get(token_id) if include_cur_price else None
+
+            sells = []
+            n = len(sub)
+            for idx, r in enumerate(sub):
+                seq = n - idx
+                exit_at = r.get("exit_at") or ""
+                try:
+                    dt = datetime.fromisoformat(exit_at.replace("Z", "+00:00")) if exit_at else None
+                    date_str = dt.strftime("%m-%d %H:%M") if dt else ""
+                except Exception:
+                    date_str = exit_at[:16]
+                size_val = float(r.get("size") or 0)
+                exit_p = float(r.get("exit_price") or 0)
+                entry_avg = float(r.get("avg_entry_price") or 0)
+                revenue = exit_p * size_val
+                cost = entry_avg * size_val
+                pnl = float(r.get("realized_pnl_usd") or 0)
+                roi = float(r.get("realized_pnl_pct") or 0)
+                hrs = float(r.get("hold_duration_hours") or 0)
+                d = int(hrs // 24)
+                rem_h = int(hrs - d * 24)
+                duration = f"{d}天{rem_h}小时" if d > 0 else f"{rem_h}小时"
+                trigger = r.get("exit_reason") or None
+                # 涨跌 (相对 exit price). resolved 行用 final_outcome*100 直接, in_progress 用 cur_price.
+                change_pp = None
+                if include_resolution and r.get("final_outcome") is not None:
+                    change_pp = round((float(r["final_outcome"]) - exit_p) * 100, 2)
+                elif include_cur_price and cp is not None:
+                    change_pp = round((cp - exit_p) * 100, 2)
+                sell = {
+                    "seq": seq,
+                    "date": date_str,
+                    "size": round(size_val, 4),
+                    "price": round(exit_p, 4),
+                    "revenue": round(revenue, 4),
+                    "entry_avg": round(entry_avg, 4) if entry_avg else None,
+                    "cost": round(cost, 4),
+                    "pnl": round(pnl, 4),
+                    "roi": round(roi, 2),
+                    "duration": duration,
+                    "trigger": trigger,
+                    "change_pp": change_pp,
+                    "side": r.get("side"),
+                    "tag": r.get("tag"),
+                    "cluster_id": r.get("cluster_id"),
+                    "stop_loss_tier": r.get("stop_loss_tier"),
+                }
+                if include_resolution:
+                    sell["final_outcome"] = r.get("final_outcome")
+                    sell["is_correct"] = r.get("is_correct")
+                    sell["resolved_at"] = r.get("resolved_at")
+                sells.append(sell)
+
+            try:
+                latest_ts = sub[0].get("exit_at") or ""
+                latest_dt = datetime.fromisoformat(latest_ts.replace("Z", "+00:00")) if latest_ts else None
+                latest_str = latest_dt.strftime("%m-%d %H:%M") if latest_dt else ""
+            except Exception:
+                latest_str = ""
+
+            cards.append({
+                "token_id": token_id,
+                "title": head.get("market_slug") or "",
+                "cur_price": round(cp, 4) if cp is not None else None,
+                "sell_count": n,
+                "latest_sell_date": latest_str,
+                "latest_sell_ts": sub[0].get("exit_at") or "",
+                "sells": sells,
+            })
+        cards.sort(key=lambda x: x["latest_sell_ts"], reverse=True)
+        return cards
+
+    @app.route("/api/history/in_progress")
+    def history_in_progress():
+        """v5.10.1: 进行中 (已卖未结算). 按 token group, 跟老 sell-card 样式兼容.
+        数据源 = closed_positions where is_resolved=0. cur_price 用 batch Gamma."""
+        try:
+            from modules.db import get_closed_positions_in_progress
+            rows = get_closed_positions_in_progress(limit=300)
+            cards = _group_closed_rows_into_cards(rows, include_cur_price=True, include_resolution=False)
+            return jsonify({"ok": True, "rows": cards, "count": len(cards)})
+        except Exception as e:
+            log.exception(f"history_in_progress error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/history/resolved")
+    def history_resolved():
+        """v5.10.1: 已结算. 按 token group, sell-card 样式. change_pp = final_outcome - exit_price."""
+        try:
+            from modules.db import get_closed_positions_resolved
+            rows = get_closed_positions_resolved(limit=500)
+            cards = _group_closed_rows_into_cards(rows, include_cur_price=False, include_resolution=True)
+            return jsonify({"ok": True, "rows": cards, "count": len(cards)})
+        except Exception as e:
+            log.exception(f"history_resolved error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/history/analytics")
+    def history_analytics():
+        """v5.10: 一次性返回 pnl_summary + win_rate_by_{tag,tier,cluster} + calibration_report."""
+        try:
+            from modules.db import (
+                get_pnl_summary, get_win_rate_by_dim, get_calibration_report,
+                get_history_extras,
+            )
+            return jsonify({
+                "ok": True,
+                "summary": get_pnl_summary(),
+                "by_tag": get_win_rate_by_dim("tag"),
+                "by_tier": get_win_rate_by_dim("stop_loss_tier"),
+                "by_cluster": get_win_rate_by_dim("cluster_id"),
+                "calibration": get_calibration_report(),
+                "extras": get_history_extras(),   # v7.x #8: 时间趋势/卖飞/盈亏分布/按出场方式
+            })
+        except Exception as e:
+            log.exception(f"history_analytics error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    @app.route("/api/history/export")
+    def history_export():
+        """v5.10: 全量 closed_positions CSV. 科研用. ?format=csv (默认) | json."""
+        try:
+            from modules.db import get_all_closed_positions
+            rows = get_all_closed_positions()
+            fmt = (flask_request.args.get("format") or "csv").lower()
+            if fmt == "json":
+                return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+            # CSV
+            from flask import Response
+            import csv, io
+            buf = io.StringIO()
+            if rows:
+                writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                for r in rows:
+                    writer.writerow(r)
+            else:
+                buf.write("(empty)\n")
+            csv_str = buf.getvalue()
+            return Response(
+                csv_str,
+                mimetype="text/csv",
+                headers={
+                    "Content-Disposition": "attachment; filename=closed_positions_export.csv",
+                    "Cache-Control": "no-store",
+                },
+            )
+        except Exception as e:
+            log.exception(f"history_export error: {e}")
+            return jsonify({"ok": False, "message": str(e)})
+
+    from modules.tag_routes import register_tag_routes
+    register_tag_routes(app)
+    return app
